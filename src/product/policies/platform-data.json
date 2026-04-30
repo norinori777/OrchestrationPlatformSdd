@@ -1,0 +1,71 @@
+{
+  "users": {
+    "super-admin": {
+      "roles": ["super-admin"],
+      "tenants": ["tenant-a", "tenant-b"]
+    },
+    "alice": {
+      "roles": [],
+      "tenants": ["tenant-a"]
+    },
+    "bob": {
+      "roles": [],
+      "tenants": ["tenant-a", "tenant-b"]
+    },
+    "charlie": {
+      "roles": [],
+      "tenants": ["tenant-b"]
+    }
+  },
+  "tenants": {
+    "tenant-a": {
+      "users": {
+        "alice": {
+          "roles": ["admin"]
+        },
+        "bob": {
+          "roles": ["viewer"]
+        }
+      },
+      "readonly_users": []
+    },
+    "tenant-b": {
+      "users": {
+        "charlie": {
+          "roles": ["viewer"]
+        },
+        "bob": {
+          "roles": ["operator"]
+        }
+      },
+      "readonly_users": ["readonly-user"]
+    }
+  },
+  "roles": {
+    "super-admin": {
+      "permissions": []
+    },
+    "admin": {
+      "permissions": [
+        { "action": "read",   "resource": "orders" },
+        { "action": "create", "resource": "orders" },
+        { "action": "delete", "resource": "orders" },
+        { "action": "read",   "resource": "users"  },
+        { "action": "create", "resource": "users"  },
+        { "action": "delete", "resource": "users"  }
+      ]
+    },
+    "operator": {
+      "permissions": [
+        { "action": "read",   "resource": "orders" },
+        { "action": "create", "resource": "orders" }
+      ]
+    },
+    "viewer": {
+      "permissions": [
+        { "action": "read", "resource": "orders" },
+        { "action": "read", "resource": "users"  }
+      ]
+    }
+  }
+}
