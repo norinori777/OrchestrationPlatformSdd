@@ -33,15 +33,15 @@
     npx tsc --init --target es2020 --module commonjs --esModuleInterop true
     ```
 
-    最小コード（src/workflows.ts, src/worker.ts, src/client.ts）
+      最小コード（src/gPRC/workflows.ts, src/gPRC/workflow.ts, src/gPRC/client.ts）
 
-    ```
-    実行（別ターミナルで Worker 起動 → Client 起動）
-    ```bash
-    npx ts-node src/worker.ts
-    # 別ターミナル
-    npx ts-node src/client.ts
-    ```
+   ```
+   実行（別ターミナルで Worker 起動 → Client 起動）
+   ```bash
+   npx ts-node src/gPRC/workflow.ts
+   # 別ターミナル
+   npx ts-node src/gPRC/client.ts
+   ```
 
     期待する動作: Worker が 7233 に接続してタスクキューを待ち、Client の start が成功して結果を返す（"hello world"）。
 
@@ -100,11 +100,73 @@
         ```
         npx ts-node .\src\nats\subscribe2.ts
         ```
-    2. workflows.tsにhellowWorkflow2のアクティビティを追加して、アクティビティのメッセージをOpen Policy Agentに渡しながら呼び出して、判定を受け取り、実行の代替として、判定結果を出力するようにしている。worker.tsを実行する。
+      2. workflows.tsにhelloWorkflow2のアクティビティを追加して、アクティビティのメッセージをOpen Policy Agentに渡しながら呼び出して、判定を受け取り、実行の代替として、判定結果を出力するようにしている。workflow.tsを実行する。
         ```
-        npx ts-node .\src\gRPC\subscribe2.ts
+            npx ts-node .\src\gPRC\workflow.ts
         ```
     3. publish2.tsにメッセージを追加して、発行している。publish2.tsを実行して、イベントを開始して、処理が流れることを確認する。
         ```
         npx ts-node .\src\nats\publish2.ts
         ```
+
+### 動作詳細確認
+
+次は「つながったことを確認する」段階から、「どこで何が起きているかを自分で説明できる」段階に進めます。
+
+1. 各層を単体で壊してみる  
+   OPA の条件を変えて Allow と Deny を両方試し、Temporal の結果がどう変わるかを見ると、判定器の役割が明確になります。次に NATS の送信データを壊して、受信側でどこで落ちるかも確認すると、境界が見えます。
+
+2. Temporal の実行経路を観察する  
+   src/gPRC/workflow.ts と src/gPRC/workflows.ts を見ながら、Workflow と Activity の責務の違いを整理すると理解が深まります。Temporal UI で履歴を見て、Workflow 開始、Activity 実行、完了の順を追うのが有効です。
+
+3. NATS のメッセージ形式を設計し直す  
+   今は最小 JSON ですが、メッセージに requestId や source を足して、受信から完了まで同じ ID をログに出すようにすると、イベント駆動の流れを追いやすくなります。これは実運用でも重要です。
+
+4. 失敗系を1つずつ試す  
+   OPA を止める、Temporal を止める、NATS を止める、の3パターンを試して、それぞれどのプロセスがどう失敗するかを確認すると、障害時の責務分界が理解できます。成功パスより、失敗の見え方のほうが学びになります。
+
+5. テスト用の最小ケースを増やす  
+   testOpa.ts のように、NATS → Temporal → OPA のフローにも小さな確認スクリプトを足すと、手順を再現しやすくなります。次の段階では、「alice は通る」「bob は拒否される」を自動で確認できるようにすると学習効率が上がります。
+
+## さらに理解を深めるための整理
+
+このリポジトリは、単に各ミドルウェアを個別に動かすためのものではなく、「イベントを受けて、状態を持ちながら、判断して、結果を返す」流れを確認するための教材として読むと理解しやすいです。
+
+### 全体の流れ
+
+1. `publish2.ts` が NATS にイベントを送る。
+2. `subscribe2.ts` がそのイベントを受け取り、Temporal の Workflow を開始する。
+3. `workflows.ts` の `helloWorkflow2` が OPA 判定用の Activity を呼ぶ。
+4. `opa.ts` が OPA の HTTP API に問い合わせる。
+5. OPA の Rego ポリシーが `allow` / `deny` を返す。
+6. Workflow は判定結果を文字列として返し、最終的な処理結果になる。
+
+この流れを追うと、NATS は「通知」、Temporal は「実行管理」、OPA は「判定」、TypeScript のコードは「接着剤」の役割だと分かります。
+
+### 各コンポーネントの役割
+
+NATS はメッセージを配る役目です。送信側は受信側の状態を意識せずにイベントを投げられるので、疎結合にしやすいです。
+
+Temporal はワークフローの進行管理を担います。処理が途中で止まっても履歴を追いやすく、どの順番で何が起きたかを後から確認できます。
+
+OPA は「この入力に対して実行してよいか」を返す判定器です。業務ロジックの中に条件分岐を書き散らす代わりに、ポリシーとして外出しできます。
+
+### 読み方のコツ
+
+最初はコードを全部追うより、次の順番で見ると把握しやすいです。
+
+1. `src/nats/publish2.ts` でどんな入力が流れてくるかを見る。
+2. `src/nats/subscribe2.ts` でその入力が Temporal に渡る形を見る。
+3. `src/gPRC/workflows.ts` で Activity 呼び出しの前後を確認する。
+4. `src/Opa/opa.ts` と `src/Opa/policy.rego` で判定条件を見る。
+
+### 何が分かるようになるか
+
+この構成を理解できると、次の3点が説明できるようになります。
+
+1. どこがイベント駆動で、どこが同期処理か。
+2. どこに状態管理を寄せるべきか。
+3. ビジネスルールをどこに切り出すと保守しやすいか。
+
+つまり、このリポジトリは「メッセージング」「ワークフロー管理」「ポリシー判定」を分けて考える練習台です。ここを押さえると、後で SaaS 基盤を大きくしても責務分離を崩しにくくなります。
+
