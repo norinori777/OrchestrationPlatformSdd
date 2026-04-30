@@ -52,19 +52,25 @@
         { "action": "delete", "resource": "orders" },
         { "action": "read",   "resource": "users"  },
         { "action": "create", "resource": "users"  },
-        { "action": "delete", "resource": "users"  }
+        { "action": "delete", "resource": "users"  },
+        { "action": "read",   "resource": "files"  },
+        { "action": "create", "resource": "files"  },
+        { "action": "delete", "resource": "files"  }
       ]
     },
     "operator": {
       "permissions": [
         { "action": "read",   "resource": "orders" },
-        { "action": "create", "resource": "orders" }
+        { "action": "create", "resource": "orders" },
+        { "action": "read",   "resource": "files"  },
+        { "action": "create", "resource": "files"  }
       ]
     },
     "viewer": {
       "permissions": [
         { "action": "read", "resource": "orders" },
-        { "action": "read", "resource": "users"  }
+        { "action": "read", "resource": "users"  },
+        { "action": "read", "resource": "files"  }
       ]
     }
   }

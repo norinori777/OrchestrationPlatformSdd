@@ -58,12 +58,25 @@ async function main(): Promise<void> {
   }
 
   const cases: Array<[Record<string, string>, boolean]> = [
+    // orders
     [{ tenantId: 'tenant-a', userId: 'alice',       action: 'create', resource: 'orders' }, true],
     [{ tenantId: 'tenant-a', userId: 'bob',         action: 'read',   resource: 'orders' }, true],
     [{ tenantId: 'tenant-a', userId: 'bob',         action: 'delete', resource: 'orders' }, false],
     [{ tenantId: 'tenant-b', userId: 'charlie',     action: 'read',   resource: 'orders' }, true],
     [{ tenantId: 'tenant-b', userId: 'charlie',     action: 'create', resource: 'orders' }, false],
     [{ tenantId: 'tenant-a', userId: 'super-admin', action: 'delete', resource: 'users'  }, true],
+    // files — admin (alice@tenant-a) は read/create/delete 可
+    [{ tenantId: 'tenant-a', userId: 'alice',       action: 'create', resource: 'files'  }, true],
+    [{ tenantId: 'tenant-a', userId: 'alice',       action: 'read',   resource: 'files'  }, true],
+    [{ tenantId: 'tenant-a', userId: 'alice',       action: 'delete', resource: 'files'  }, true],
+    // files — operator (bob@tenant-b) は read/create 可、delete 不可
+    [{ tenantId: 'tenant-b', userId: 'bob',         action: 'read',   resource: 'files'  }, true],
+    [{ tenantId: 'tenant-b', userId: 'bob',         action: 'create', resource: 'files'  }, true],
+    [{ tenantId: 'tenant-b', userId: 'bob',         action: 'delete', resource: 'files'  }, false],
+    // files — viewer (charlie@tenant-b) は read 可、create/delete 不可
+    [{ tenantId: 'tenant-b', userId: 'charlie',     action: 'read',   resource: 'files'  }, true],
+    [{ tenantId: 'tenant-b', userId: 'charlie',     action: 'create', resource: 'files'  }, false],
+    [{ tenantId: 'tenant-b', userId: 'charlie',     action: 'delete', resource: 'files'  }, false],
   ];
 
   let passed = 0;

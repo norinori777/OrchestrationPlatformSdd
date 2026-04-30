@@ -1,0 +1,25 @@
+generator client {
+  provider = "prisma-client-js"
+  output   = "../../../node_modules/.prisma/product-client"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("PLATFORM_DATABASE_URL")
+}
+
+model PlatformRequest {
+  id        String   @id
+  tenantId  String
+  userId    String
+  action    String
+  resource  String
+  status    String   @default("pending")
+  payload   Json?
+  result    String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("platform_requests")
+  @@index([tenantId, resource])
+}

@@ -60,6 +60,8 @@ export interface Config {
   redis: RedisConfig;
   metrics: MetricsConfig;
   log: LogConfig;
+  /** SaaS Backend のベース URL。完了時に saas_requests のステータスを更新するコールバックに使用 */
+  saasBackendUrl: string;
 }
 
 function env(key: string, fallback: string): string {
@@ -113,5 +115,6 @@ export function loadConfig(): Config {
       level:   env('LOG_LEVEL',    'info') as LogConfig['level'],
       service: env('SERVICE_NAME', 'orchestration-platform'),
     },
+    saasBackendUrl: env('SAAS_BACKEND_URL', 'http://localhost:3001'),
   };
 }

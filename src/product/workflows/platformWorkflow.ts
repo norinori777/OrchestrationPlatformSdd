@@ -109,7 +109,7 @@ export async function platformWorkflow(request: PlatformRequest): Promise<Platfo
     };
 
     await sendNotificationActivity(notification);
-    await persistRequestActivity(request, 'denied');
+    await persistRequestActivity(request, 'denied', denyMsg);
 
     return response(request.requestId, 'denied', denyMsg);
   }
@@ -137,7 +137,7 @@ export async function platformWorkflow(request: PlatformRequest): Promise<Platfo
     };
 
     await sendNotificationActivity(notification);
-    await persistRequestActivity(request, 'denied');
+    await persistRequestActivity(request, 'denied', quotaMsg);
     return response(request.requestId, 'quota-exceeded', quotaMsg);
   }
   // ── Step 4: ビジネスロジック処理 ──────────────────────────────────────
@@ -145,7 +145,7 @@ export async function platformWorkflow(request: PlatformRequest): Promise<Platfo
   log.info('Processing request', { requestId: request.requestId });
 
   if (cancelled) {
-    await persistRequestActivity(request, 'failed');
+    await persistRequestActivity(request, 'failed', 'Cancelled during processing');
     return response(request.requestId, 'error', 'Cancelled during processing');
   }
 
@@ -161,7 +161,7 @@ export async function platformWorkflow(request: PlatformRequest): Promise<Platfo
     message:   result,
   });
 
-  await persistRequestActivity(request, 'completed');
+  await persistRequestActivity(request, 'completed', result);
   currentStatus = 'completed';
 
   log.info('Request completed', { requestId: request.requestId });

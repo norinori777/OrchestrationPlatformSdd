@@ -1,0 +1,23 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("FILE_SERVICE_DATABASE_URL")
+}
+
+model File {
+  id          String   @id
+  tenantId    String
+  userId      String
+  filename    String
+  size        Int?
+  contentType String?
+  storagePath String
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@map("files")
+  @@index([tenantId])
+}

@@ -7,6 +7,8 @@ services:
       - POSTGRES_USER=temporal
       - POSTGRES_PASSWORD=temporal
       - POSTGRES_DB=temporal
+    volumes:
+      - ./config/init-db.sql:/docker-entrypoint-initdb.d/init-db.sql:ro
     networks:
       - saas-platform
     ports:

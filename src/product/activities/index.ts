@@ -13,15 +13,98 @@ import { createPersistRequestActivity }   from './persistenceActivity.ts';
 import { createCheckQuotaActivity }       from './quotaActivity.ts';
 
 // ─────────────────────────────────────────────────────────────────────────────
+// マイクロサービス接続先 (環境変数で上書き可)
+// ─────────────────────────────────────────────────────────────────────────────
+const FILE_STORAGE_URL = process.env.FILE_STORAGE_SERVICE_URL ?? 'http://localhost:4001';
+const USER_SERVICE_URL = process.env.USER_SERVICE_URL         ?? 'http://localhost:4002';
+
+type RequestHandler = (request: PlatformRequest) => Promise<string>;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ハンドラマップ — action:resource → マイクロサービス HTTP 委譲
+// ─────────────────────────────────────────────────────────────────────────────
+const handlers: Record<string, RequestHandler> = {
+
+  // ── File Storage Service (:4001) ──────────────────────────────────────────
+  'create:files': async (req) => {
+    const { filename, size, contentType, storagePath } =
+      req.payload as { filename: string; size?: number; contentType?: string; storagePath: string };
+    const res = await fetch(`${FILE_STORAGE_URL}/api/files`, {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify({ id: req.requestId, tenantId: req.tenantId, userId: req.userId, filename, size, contentType, storagePath }),
+      signal:  AbortSignal.timeout(10_000),
+    });
+    if (!res.ok) throw new Error(`FileStorageService POST: HTTP ${res.status}`);
+    const data = await res.json() as { id: string; filename: string };
+    return `File created: id=${data.id}, filename=${data.filename}`;
+  },
+
+  'read:files': async (req) => {
+    const { fileId } = req.payload as { fileId: string };
+    const res = await fetch(`${FILE_STORAGE_URL}/api/files/${encodeURIComponent(fileId)}`, {
+      signal: AbortSignal.timeout(10_000),
+    });
+    if (!res.ok) throw new Error(`FileStorageService GET: HTTP ${res.status}`);
+    const data = await res.json() as { id: string; filename: string; storagePath: string };
+    return `File retrieved: id=${data.id}, filename=${data.filename}`;
+  },
+
+  'delete:files': async (req) => {
+    const { fileId } = req.payload as { fileId: string };
+    const res = await fetch(`${FILE_STORAGE_URL}/api/files/${encodeURIComponent(fileId)}`, {
+      method:  'DELETE',
+      headers: { 'X-Tenant-Id': req.tenantId },
+      signal:  AbortSignal.timeout(10_000),
+    });
+    if (!res.ok) throw new Error(`FileStorageService DELETE: HTTP ${res.status}`);
+    return `File deleted: id=${fileId}`;
+  },
+
+  // ── User Service (:4002) ──────────────────────────────────────────────────
+  'create:users': async (req) => {
+    const { email, name, role } = req.payload as { email: string; name: string; role?: string };
+    const res = await fetch(`${USER_SERVICE_URL}/api/users`, {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify({ id: req.requestId, tenantId: req.tenantId, email, name, role: role ?? 'viewer' }),
+      signal:  AbortSignal.timeout(10_000),
+    });
+    if (!res.ok) throw new Error(`UserService POST: HTTP ${res.status}`);
+    const data = await res.json() as { id: string; email: string };
+    return `User created: id=${data.id}, email=${data.email}`;
+  },
+
+  'read:users': async (req) => {
+    const { userId } = req.payload as { userId: string };
+    const res = await fetch(`${USER_SERVICE_URL}/api/users/${encodeURIComponent(userId)}`, {
+      signal: AbortSignal.timeout(10_000),
+    });
+    if (!res.ok) throw new Error(`UserService GET: HTTP ${res.status}`);
+    const data = await res.json() as { id: string; email: string; name: string };
+    return `User retrieved: id=${data.id}, email=${data.email}`;
+  },
+
+  'delete:users': async (req) => {
+    const { userId } = req.payload as { userId: string };
+    const res = await fetch(`${USER_SERVICE_URL}/api/users/${encodeURIComponent(userId)}`, {
+      method:  'DELETE',
+      headers: { 'X-Tenant-Id': req.tenantId },
+      signal:  AbortSignal.timeout(10_000),
+    });
+    if (!res.ok) throw new Error(`UserService DELETE: HTTP ${res.status}`);
+    return `User deleted: id=${userId}`;
+  },
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
 // ドメインロジック アクティビティ
-// action / resource に応じてハンドラを切り替える拡張ポイントです。
 // ─────────────────────────────────────────────────────────────────────────────
 async function processRequestActivity(request: PlatformRequest): Promise<string> {
-  // 実運用では action × resource のマトリクスで専用ハンドラへディスパッチします:
-  // const handler = handlers[`${request.action}:${request.resource}`];
-  // if (!handler) throw new Error(`No handler for ${request.action}:${request.resource}`);
-  // return handler(request);
-  return `Processed: ${request.action} on ${request.resource} (tenant: ${request.tenantId}, reqId: ${request.requestId})`;
+  const key     = `${request.action}:${request.resource}`;
+  const handler = handlers[key];
+  if (!handler) throw new Error(`No handler registered for "${key}"`);
+  return handler(request);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -42,6 +125,6 @@ export type PlatformActivities = {
   evaluatePolicyActivity(input: PolicyInput): Promise<boolean>;
   processRequestActivity(request: PlatformRequest): Promise<string>;
   sendNotificationActivity(payload: NotificationPayload): Promise<void>;
-  persistRequestActivity(request: PlatformRequest, status: RequestStatus): Promise<void>;
+  persistRequestActivity(request: PlatformRequest, status: RequestStatus, result?: string): Promise<void>;
   checkQuotaActivity(request: PlatformRequest): Promise<QuotaResult>;
 };
