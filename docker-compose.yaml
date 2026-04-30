@@ -1,0 +1,67 @@
+services:
+  # 1. Database (Temporalと業務データの両方で使用可能)
+  postgres:
+    image: postgres:15-alpine
+    container_name: postgres
+    environment:
+      - POSTGRES_USER=temporal
+      - POSTGRES_PASSWORD=temporal
+      - POSTGRES_DB=temporal
+    networks:
+      - saas-platform
+    ports:
+      - "5432:5432"
+
+  # 2. Temporal Server (Admin Tools, Web UI含む)
+  temporal:
+    image: temporalio/auto-setup:1.22
+    container_name: temporal
+    environment:
+      - DB=postgresql
+      - DB_PORT=5432
+      - POSTGRES_USER=temporal
+      - POSTGRES_PWD=temporal
+      - POSTGRES_SEEDS=postgres
+    depends_on:
+      - postgres
+    networks:
+      - saas-platform
+    ports:
+      - "7233:7233" # gRPC (SDK用)
+
+  # 3. Temporal Web UI
+  temporal-ui:
+    image: temporalio/ui:latest
+    container_name: temporal-ui
+    environment:
+      - TEMPORAL_ADDRESS=temporal:7233
+    depends_on:
+      - temporal
+    networks:
+      - saas-platform
+    ports:
+      - "8080:8080" # Web UI用
+
+  # 4. NATS (JetStream有効 - メッセージの永続化)
+  nats:
+    image: nats:2.10-alpine
+    container_name: nats
+    command: ["-js"] # JetStreamを有効化
+    networks:
+      - saas-platform
+    ports:
+      - "4222:4222" # クライアント通信
+      - "8222:8222" # モニタリング用
+
+  # 5. Open Policy Agent (OPA)
+  opa:
+    image: openpolicyagent/opa:latest
+    container_name: opa
+    command: ["run", "--server", "--log-level=debug", "--addr=0.0.0.0:8181"]
+    networks:
+      - saas-platform
+    ports:
+      - "8181:8181" # REST API用
+networks:
+  saas-platform:
+    driver: bridge
