@@ -4,8 +4,9 @@
 // ・タイムアウト付きフェッチ (AbortController)
 // ─────────────────────────────────────────────────────────────────────────────
 import fetch from 'node-fetch';
-import type { Config } from '../config.ts';
-import type { Logger } from '../logger.ts';
+import { opaDecisionsTotal, opaDecisionDurationSeconds } from '../metrics.ts';
+import type { Config }      from '../config.ts';
+import type { Logger }      from '../logger.ts';
 import type { PolicyInput } from '../types.ts';
 
 function sleep(ms: number): Promise<void> {
@@ -26,7 +27,9 @@ export function createEvaluatePolicyActivity(config: Config, logger: Logger) {
 
     for (let attempt = 1; attempt <= config.opa.maxRetries; attempt++) {
       const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), config.opa.timeoutMs);
+      const timer      = setTimeout(() => controller.abort(), config.opa.timeoutMs);
+      // レイテンシ計測開始 (endTimer() 呼び出し時にヒストグラムへ記録)
+      const endTimer   = opaDecisionDurationSeconds.startTimer();
 
       try {
         const res = await fetch(url, {
@@ -46,6 +49,11 @@ export function createEvaluatePolicyActivity(config: Config, logger: Logger) {
 
         const json = (await res.json()) as { result?: unknown };
         const allowed = Boolean(json.result);
+
+        // ── Prometheus メトリクスを記録 ────────────────────────────────────────
+        opaDecisionsTotal.inc({ result: allowed ? 'allow' : 'deny' });
+        endTimer();
+
         actLog.info('Policy evaluated', { allowed, attempt });
         return allowed;
       } catch (err: unknown) {

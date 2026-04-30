@@ -33,6 +33,20 @@ export interface HealthConfig {
   host: string;
 }
 
+export interface RedisConfig {
+  url: string;
+  /** クォータ集計ウィンドウ (秒)。デフォルト 3600 = 1 時間 */
+  quotaWindowSeconds: number;
+  /** テナント別設定がない場合のデフォルトクォータ上限 */
+  defaultQuotaLimit: number;
+}
+
+export interface MetricsConfig {
+  /** /metrics を公開するポート (Prometheus スクレイプ先) */
+  port: number;
+  host: string;
+}
+
 export interface LogConfig {
   level: 'debug' | 'info' | 'warn' | 'error';
   service: string;
@@ -43,6 +57,8 @@ export interface Config {
   nats: NatsConfig;
   opa: OpaConfig;
   health: HealthConfig;
+  redis: RedisConfig;
+  metrics: MetricsConfig;
   log: LogConfig;
 }
 
@@ -83,6 +99,15 @@ export function loadConfig(): Config {
     health: {
       port: envNum('HEALTH_PORT', 3000),
       host: env('HEALTH_HOST',   '0.0.0.0'),
+    },
+    redis: {
+      url:                env('REDIS_URL',               'redis://localhost:6379'),
+      quotaWindowSeconds: envNum('REDIS_QUOTA_WINDOW_SECS', 3_600),
+      defaultQuotaLimit:  envNum('REDIS_DEFAULT_QUOTA_LIMIT', 1_000),
+    },
+    metrics: {
+      port: envNum('METRICS_PORT', 9100),
+      host: env('METRICS_HOST',   '0.0.0.0'),
     },
     log: {
       level:   env('LOG_LEVEL',    'info') as LogConfig['level'],

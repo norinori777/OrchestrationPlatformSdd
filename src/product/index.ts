@@ -16,6 +16,8 @@ import { createLogger }       from './logger.ts';
 import { startWorker }        from './worker.ts';
 import { startGateway }       from './gateway.ts';
 import { startHealthServer }  from './healthServer.ts';
+import { startMetricsServer } from './metricsServer.ts';
+import { createRedisClient }  from './cache.ts';
 
 async function main(): Promise<void> {
   // ── 設定 / ロガー ─────────────────────────────────────────────────────
@@ -29,6 +31,8 @@ async function main(): Promise<void> {
     taskQueue: config.temporal.taskQueue,
     nats:      config.nats.servers,
     opa:       config.opa.baseUrl,
+    redis:     config.redis.url,
+    metrics:   `${config.metrics.host}:${config.metrics.port}`,
   });
 
   // ── Graceful shutdown ────────────────────────────────────────────────
@@ -44,6 +48,14 @@ async function main(): Promise<void> {
 
   process.once('SIGTERM', () => shutdown('SIGTERM'));
   process.once('SIGINT',  () => shutdown('SIGINT'));
+
+  // ── Redis クライアント ──────────────────────────────────────────
+  const redis = createRedisClient(config.redis.url);
+  redis.on('connect', () => log.info('Redis connected'));
+  redis.on('error',   (err: Error) => log.error('Redis error', { msg: err.message }));
+
+  // ── メトリクスサーバー (/metrics エンドポイント) ───────────────────
+  const closeMetrics = startMetricsServer(config.metrics.port, config.metrics.host, logger);
 
   // ── ヘルスサーバー ───────────────────────────────────────────────────
   const closeHealth = startHealthServer({
@@ -62,7 +74,7 @@ async function main(): Promise<void> {
   }, logger);
 
   // ── Temporal ワーカー ─────────────────────────────────────────────────
-  const worker = await startWorker(config, logger);
+  const worker = await startWorker(config, logger, redis);
 
   // シャットダウン時にワーカーも停止
   shutdownCtrl.signal.addEventListener('abort', () => {
@@ -77,7 +89,9 @@ async function main(): Promise<void> {
       startGateway(config, logger, shutdownCtrl.signal),
     ]);
   } finally {
+    closeMetrics();
     closeHealth();
+    await redis.quit().catch(() => { /* ignore */ });
     log.info('Platform stopped');
   }
 }

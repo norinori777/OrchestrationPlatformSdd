@@ -1,0 +1,118 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Vector 0.38 パイプライン設定
+#
+# パイプライン:
+#   [sources]
+#     docker_services_logs  Docker コンテナ (temporal/nats/opa/postgres) のログ
+#     platform_http         プラットフォーム本体が HTTP で Push するログ (:9001)
+#   [transforms]
+#     parse_json_logs       メッセージを JSON パースして構造化フィールドへ展開
+#     filter_noise          DEBUG ログや Vector 内部ログを除去
+#     add_metadata          環境・サービス名を付与
+#   [sinks]
+#     console_out           整形済み JSON を stdout へ出力 (開発用)
+#     postgres_out          PostgreSQL の platform_logs テーブルへ永続化 (有効化手順は下記)
+#
+# PostgreSQL sink を有効化する場合:
+#   1. 以下の postgres_out セクションのコメントを外す
+#   2. 環境変数 VECTOR_PG_CONNECTION_STRING を設定する
+#   3. 事前に platform_logs テーブルを作成する (スキーマは design.md 参照)
+# ─────────────────────────────────────────────────────────────────────────────
+
+api:
+  enabled: true
+  address: "0.0.0.0:8686"   # Vector API・監視エンドポイント
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Sources
+# ─────────────────────────────────────────────────────────────────────────────
+sources:
+  # Docker コンテナログ (temporal / nats / opa / postgres)
+  docker_services_logs:
+    type: docker_logs
+    include_containers:
+      - temporal
+      - nats
+      - opa
+      - postgres
+      - redis
+
+  # プラットフォーム本体からの HTTP Push ログ
+  # (platform の logger.ts が JSON を POST する場合に使用)
+  platform_http:
+    type: http_server
+    address: "0.0.0.0:9001"
+    encoding: json
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Transforms
+# ─────────────────────────────────────────────────────────────────────────────
+transforms:
+  # JSON メッセージを構造化フィールドへ展開
+  parse_json_logs:
+    type: remap
+    inputs:
+      - docker_services_logs
+      - platform_http
+    source: |
+      # メッセージが JSON の場合はパースしてフィールドをマージ
+      parsed, err = parse_json(.message)
+      if err == null {
+        . = merge!(., parsed)
+        del(.message)
+      }
+
+      # コンテナ名をサービス名として保持
+      if exists(.container_name) {
+        .service_name = string!(.container_name)
+      } else if exists(.service) {
+        .service_name = string!(.service)
+      } else {
+        .service_name = "unknown"
+      }
+
+      # 統一タイムスタンプフィールド
+      if !exists(.ts) {
+        .ts = format_timestamp!(now(), format: "%+")
+      }
+
+  # ノイズフィルタ: DEBUG ログ・Vector 内部ログを除去
+  filter_noise:
+    type: filter
+    inputs:
+      - parse_json_logs
+    condition: |
+      # level が存在しない場合は通す。DEBUG は除去。
+      !exists(.level) || string!(.level) != "debug"
+
+  # 環境メタデータを付与
+  add_metadata:
+    type: remap
+    inputs:
+      - filter_noise
+    source: |
+      .environment = "local"
+      .pipeline     = "vector"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Sinks
+# ─────────────────────────────────────────────────────────────────────────────
+sinks:
+  # 開発用: 整形済み JSON を stdout へ出力
+  console_out:
+    type: console
+    inputs:
+      - add_metadata
+    encoding:
+      codec: json
+
+  # PostgreSQL sink を有効化する場合:
+  #   1. 下記の設定ブロックのコメントを外して connection に接続文字列を直接記述する
+  #   2. 事前に platform_logs テーブルを作成する
+  #
+  # postgres_out:
+  #   type: postgresql
+  #   inputs:
+  #     - add_metadata
+  #   connection: "host=postgres port=5432 dbname=platform user=platform password=platform"
+  #   table: "platform_logs"

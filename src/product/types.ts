@@ -21,7 +21,7 @@ export interface PlatformRequest {
 /** リクエスト処理の最終結果 */
 export interface PlatformResponse {
   requestId: string;
-  status: 'allowed' | 'denied' | 'error';
+  status: 'allowed' | 'denied' | 'quota-exceeded' | 'error';
   message: string;
   processedAt: string;
 }
@@ -45,3 +45,13 @@ export interface NotificationPayload {
 
 /** リクエストの処理ステータス */
 export type RequestStatus = 'pending' | 'denied' | 'completed' | 'failed';
+
+/** Redis クォータチェックの結果 */
+export interface QuotaResult {
+  /** クォータ上限内かどうか */
+  allowed: boolean;
+  /** 現在のウィンドウ内リクエスト数 */
+  current: number;
+  /** 設定されたクォータ上限 */
+  limit: number;
+}

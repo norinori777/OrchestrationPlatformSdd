@@ -5,10 +5,12 @@
 // ─────────────────────────────────────────────────────────────────────────────
 import type { Config } from '../config.ts';
 import type { Logger } from '../logger.ts';
-import type { PlatformRequest, PolicyInput, NotificationPayload, RequestStatus } from '../types.ts';
+import type { PlatformRequest, PolicyInput, NotificationPayload, RequestStatus, QuotaResult } from '../types.ts';
+import type Redis from 'ioredis';
 import { createEvaluatePolicyActivity }   from './opaActivity.ts';
 import { createSendNotificationActivity } from './notificationActivity.ts';
 import { createPersistRequestActivity }   from './persistenceActivity.ts';
+import { createCheckQuotaActivity }       from './quotaActivity.ts';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // ドメインロジック アクティビティ
@@ -25,11 +27,12 @@ async function processRequestActivity(request: PlatformRequest): Promise<string>
 // ─────────────────────────────────────────────────────────────────────────────
 // ファクトリ — config/logger を DI してワーカーへ渡すオブジェクトを生成
 // ─────────────────────────────────────────────────────────────────────────────
-export function createActivities(config: Config, logger: Logger) {
+export function createActivities(config: Config, logger: Logger, redis: Redis) {
   return {
     evaluatePolicyActivity:   createEvaluatePolicyActivity(config, logger),
     sendNotificationActivity: createSendNotificationActivity(config, logger),
     persistRequestActivity:   createPersistRequestActivity(config, logger),
+    checkQuotaActivity:       createCheckQuotaActivity(config, logger, redis),
     processRequestActivity,
   };
 }
@@ -40,4 +43,5 @@ export type PlatformActivities = {
   processRequestActivity(request: PlatformRequest): Promise<string>;
   sendNotificationActivity(payload: NotificationPayload): Promise<void>;
   persistRequestActivity(request: PlatformRequest, status: RequestStatus): Promise<void>;
+  checkQuotaActivity(request: PlatformRequest): Promise<QuotaResult>;
 };

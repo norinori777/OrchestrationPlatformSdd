@@ -17,6 +17,13 @@ import {
 } from 'nats';
 import { Connection, WorkflowClient } from '@temporalio/client';
 import { platformWorkflow } from './workflows/platformWorkflow.ts';
+import {
+  natsMessagesReceivedTotal,
+  natsMessagesAckedTotal,
+  natsMessagesNakTotal,
+  natsDlqTotal,
+  workflowStartedTotal,
+} from './metrics.ts';
 import type { Config } from './config.ts';
 import type { Logger } from './logger.ts';
 import type { PlatformRequest } from './types.ts';
@@ -104,12 +111,14 @@ export async function startGateway(
       msgLog.error('Malformed message, sending to DLQ', { errMsg });
       // 不正形式のメッセージは DLQ に転送して ack (リトライしない)
       nc.publish(config.nats.dlqSubject, msg.data);
+      natsDlqTotal.inc();
       msg.ack();
       continue;
     }
 
     const reqLog = msgLog.child({ requestId: request.requestId, action: request.action });
     reqLog.info('Received platform event');
+    natsMessagesReceivedTotal.inc({ subject: msg.subject });
 
     // ── Temporal ワークフロー起動 ─────────────────────────────────────
     try {
@@ -121,6 +130,8 @@ export async function startGateway(
       });
 
       reqLog.info('Workflow started', { workflowId: handle.workflowId });
+      workflowStartedTotal.inc({ task_queue: config.temporal.taskQueue });
+      natsMessagesAckedTotal.inc();
       msg.ack();
     } catch (err: unknown) {
       const errMsg = err instanceof Error ? err.message : String(err);
@@ -132,11 +143,13 @@ export async function startGateway(
         errMsg.includes('WorkflowExecutionAlreadyStarted')
       ) {
         reqLog.warn('Duplicate request — workflow already running, acking', { errMsg });
+        natsMessagesAckedTotal.inc();
         msg.ack();
         continue;
       }
 
       reqLog.error('Failed to start workflow, will retry', { errMsg });
+      natsMessagesNakTotal.inc();
       // JetStream が ackWait 後に再配送する
       msg.nak(5_000); // 5 秒後に再配送をリクエスト
     }

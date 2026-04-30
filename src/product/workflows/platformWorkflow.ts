@@ -22,7 +22,7 @@ import {
   setHandler,
   log,
 } from '@temporalio/workflow';
-import type { PlatformRequest, PlatformResponse, PolicyInput, NotificationPayload } from '../types.ts';
+import type { PlatformRequest, PlatformResponse, PolicyInput, NotificationPayload, QuotaResult } from '../types.ts';
 import type { PlatformActivities } from '../activities/index.ts';
 
 // アクティビティプロキシ — タイムアウト・リトライポリシーを設定
@@ -31,6 +31,7 @@ const {
   processRequestActivity,
   sendNotificationActivity,
   persistRequestActivity,
+  checkQuotaActivity,
 } = proxyActivities<PlatformActivities>({
   startToCloseTimeout: '30 seconds',
   retry: {
@@ -51,6 +52,13 @@ export const getStatusQuery = defineQuery<string>('getStatus');
 
 // ─────────────────────────────────────────────────────────────────────────────
 // メインワークフロー
+//
+// フロー:
+//   1. DB 保存 (pending)
+//   2. OPA ポリシー評価 → denied なら終了
+//   3. クォータチェック → 超過なら終了
+//   4. ビジネスロジック処理
+//   5. 成功通知 + DB 更新 (completed)
 // ─────────────────────────────────────────────────────────────────────────────
 export async function platformWorkflow(request: PlatformRequest): Promise<PlatformResponse> {
   let cancelled    = false;
@@ -105,7 +113,33 @@ export async function platformWorkflow(request: PlatformRequest): Promise<Platfo
 
     return response(request.requestId, 'denied', denyMsg);
   }
+  // ── Step 3: クォータチェック (Redis スライディングウィンドウ) ────────────────
+  currentStatus = 'checking-quota';
+  log.info('Checking quota', { requestId: request.requestId });
 
+  const quotaResult: QuotaResult = await checkQuotaActivity(request);
+
+  if (!quotaResult.allowed) {
+    currentStatus = 'quota-exceeded';
+    log.warn('Quota exceeded', {
+      requestId: request.requestId,
+      current:   quotaResult.current,
+      limit:     quotaResult.limit,
+    });
+
+    const quotaMsg = `Quota exceeded for resource "${request.resource}": ${quotaResult.current}/${quotaResult.limit} requests in window`;
+    const notification: NotificationPayload = {
+      tenantId:  request.tenantId,
+      userId:    request.userId,
+      requestId: request.requestId,
+      status:    'denied',
+      message:   quotaMsg,
+    };
+
+    await sendNotificationActivity(notification);
+    await persistRequestActivity(request, 'denied');
+    return response(request.requestId, 'quota-exceeded', quotaMsg);
+  }
   // ── Step 4: ビジネスロジック処理 ──────────────────────────────────────
   currentStatus = 'processing';
   log.info('Processing request', { requestId: request.requestId });

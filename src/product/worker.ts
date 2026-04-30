@@ -5,18 +5,19 @@
 // ─────────────────────────────────────────────────────────────────────────────
 import { Worker, NativeConnection } from '@temporalio/worker';
 import { fileURLToPath } from 'url';
+import type Redis from 'ioredis';
 import type { Config } from './config.ts';
 import type { Logger } from './logger.ts';
 import { createActivities } from './activities/index.ts';
 
-export async function startWorker(config: Config, logger: Logger): Promise<Worker> {
+export async function startWorker(config: Config, logger: Logger, redis: Redis): Promise<Worker> {
   const log = logger.child({ component: 'worker' });
 
   const connection = await NativeConnection.connect({
     address: config.temporal.address,
   });
 
-  const activities   = createActivities(config, logger);
+  const activities   = createActivities(config, logger, redis);
   const workflowsPath = fileURLToPath(
     new URL('./workflows/platformWorkflow.ts', import.meta.url),
   );

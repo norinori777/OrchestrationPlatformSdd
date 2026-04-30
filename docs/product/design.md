@@ -1,8 +1,10 @@
 # オーケストレーションプラットフォーム 設計書
 
 > 対象ディレクトリ: `src/product/`  
-> バージョン: 1.0  
-> 作成日: 2026-04-30
+> バージョン: 1.2  
+> 作成日: 2026-04-30  
+> 改訂日: 2026-04-30 (v1.1 — Prometheus / Vector / Redis 追加)  
+> 改訂日: 2026-04-30 (v1.2 — OPA diagnostic-addr / Vector VRL 修正)
 
 ---
 
@@ -15,6 +17,9 @@
 - Open Policy Agent (OPA) による**テナント RBAC 認可**
 - Temporal による**ワークフローのステート管理と信頼性保証**
 - PostgreSQL による**リクエスト永続化**
+- **Redis** によるレート制限 (クォータ管理) と共有状態管理
+- **Prometheus + prom-client** による定量的なメトリクス収集
+- **Vector** によるコンテナログの集約・変換パイプライン
 - Kubernetes / ECS に対応した**ヘルスチェックエンドポイント**
 
 ---
@@ -57,6 +62,7 @@
 │  ├── Workflow: platformWorkflow                                       │
 │  └── Activities:                                                     │
 │       ├── evaluatePolicyActivity  (OPA HTTP API)                     │
+│       ├── checkQuotaActivity      (Redis スライディングウィンドウ)      │
 │       ├── processRequestActivity  (ドメインロジック)                   │
 │       ├── sendNotificationActivity (Webhook/Email)                   │
 │       └── persistRequestActivity  (PostgreSQL)                       │
@@ -64,14 +70,25 @@
                             │
            ┌────────────────┼──────────────────┐
            ▼                ▼                  ▼
-    ┌─────────────┐  ┌───────────┐    ┌──────────────┐
-    │ OPA         │  │ PostgreSQL│    │ 通知先        │
-    │ :8181       │  │ :5432     │    │ (Webhook 等)  │
-    └─────────────┘  └───────────┘    └──────────────┘
+    ┌─────────────────┐  ┌───────────┐    ┌──────────────┐
+    │ OPA              │  │ PostgreSQL│    │ 通知先        │
+    │ :8181 (REST API) │  │ :5432     │    │ (Webhook 等)  │
+    │ :8282 (metrics)  │  └───────────┘    └──────────────┘
+    └─────────────────┘
 
-      Health Server :3000
-      GET /health/live   → 200
-      GET /health/ready  → 200 / 503
+    ┌─────────────┐
+    │ Redis       │  ← クォータカウンター / サービスフラグ
+    │ :6379       │
+    └─────────────┘
+
+      Health Server     :3000   GET /health/live, /health/ready
+      Metrics Server    :9100   GET /metrics  (Prometheus スクレイプ先)
+
+┌──────────────────────────────────────────────────────────────────────┐
+│  可観測性スタック                                                     │
+│  Prometheus  :9090   メトリクス収集 (platform / OPA / NATS / Vector) │
+│  Vector      :8686   コンテナログ集約 → parse → sink                  │
+└──────────────────────────────────────────────────────────────────────┘
 ```
 
 ### 2.2 ファイル構成
@@ -81,15 +98,19 @@ src/product/
 ├── config.ts                   設定ロード (環境変数ベース)
 ├── logger.ts                   構造化 JSON ロガー
 ├── types.ts                    共有型定義
+├── metrics.ts                  Prometheus メトリクス定義
+├── cache.ts                    Redis クライアント + クォータ / キャッシュヘルパー
 ├── worker.ts                   Temporal ワーカー起動
 ├── gateway.ts                  NATS → Temporal ゲートウェイ
-├── healthServer.ts             HTTP ヘルスチェックサーバー
+├── healthServer.ts             HTTP ヘルスチェックサーバー (:3000)
+├── metricsServer.ts            HTTP メトリクスサーバー (:9100)
 ├── index.ts                    メインエントリポイント
 ├── workflows/
 │   └── platformWorkflow.ts    メインワークフロー定義
 ├── activities/
 │   ├── index.ts               アクティビティレジストリ
-│   ├── opaActivity.ts         OPA ポリシー評価
+│   ├── opaActivity.ts         OPA ポリシー評価 (Prometheus 計装済)
+│   ├── quotaActivity.ts       Redis クォータチェック
 │   ├── notificationActivity.ts 通知送信
 │   └── persistenceActivity.ts DB 永続化
 └── policies/
@@ -127,11 +148,21 @@ Temporal がワークフロー開始
   │   └─ ワークフロー終了 (status: denied)
   │
   └─ [allow=true]
-      ├─ Step 3: processRequestActivity(request)
-      │           → ドメインロジック実行
-      ├─ Step 4: sendNotificationActivity("allowed")
-      ├─ Step 5: persistRequestActivity(request, "completed")
-      └─ ワークフロー終了 (status: allowed)
+      ├─ Step 3: checkQuotaActivity(request)
+      │           → Redis INCR + Lua EXPIRE (原子操作)
+      │           → allowed=true / false を返す
+      │
+      ├─ [allowed=false]
+      │   ├─ sendNotificationActivity("denied")  ← quota-exceeded
+      │   ├─ persistRequestActivity(request, "denied")
+      │   └─ ワークフロー終了 (status: quota-exceeded)
+      │
+      └─ [allowed=true]
+          ├─ Step 4: processRequestActivity(request)
+          │           → ドメインロジック実行
+          ├─ Step 5: sendNotificationActivity("allowed")
+          ├─ Step 6: persistRequestActivity(request, "completed")
+          └─ ワークフロー終了 (status: allowed)
 ```
 
 ### 3.2 異常系フロー
@@ -144,6 +175,8 @@ Temporal がワークフロー開始
 | 不正形式メッセージ | DLQ subject へ転送 → `ack` (リトライしない) |
 | Activity 失敗 | Temporal が `maximumAttempts: 3` まで自動リトライ |
 | キャンセルシグナル | `cancel` Signal 受信 → `persistRequestActivity("failed")` → 終了 |
+| Redis 接続失敗 | `checkQuotaActivity` が Temporal によりリトライ (max 3 回) |
+| クォータ超過 | `checkQuotaActivity` が `allowed=false` → quota-exceeded パスへ遷移 |
 
 ---
 
@@ -172,6 +205,11 @@ Temporal がワークフロー開始
 | `OPA_MAX_RETRIES` | `3` | OPA リトライ最大回数 |
 | `HEALTH_PORT` | `3000` | ヘルスチェックサーバーポート |
 | `HEALTH_HOST` | `0.0.0.0` | ヘルスチェックサーバーバインドアドレス |
+| `REDIS_URL` | `redis://localhost:6379` | Redis 接続 URL |
+| `REDIS_QUOTA_WINDOW_SECS` | `3600` | クォータ集計ウィンドウ (秒) |
+| `REDIS_DEFAULT_QUOTA_LIMIT` | `1000` | テナント別設定がない場合のデフォルトクォータ上限 |
+| `METRICS_PORT` | `9100` | `/metrics` エンドポイントポート (Prometheus スクレイプ先) |
+| `METRICS_HOST` | `0.0.0.0` | メトリクスサーバーバインドアドレス |
 | `LOG_LEVEL` | `info` | ログレベル (debug/info/warn/error) |
 | `SERVICE_NAME` | `orchestration-platform` | ログの `service` フィールド |
 
@@ -197,10 +235,11 @@ JSON 形式で stdout (info/debug/warn) / stderr (error) へ出力します。
 | 型 | 説明 |
 |---|---|
 | `PlatformRequest` | NATS から受信するリクエスト本体 |
-| `PlatformResponse` | ワークフローの最終応答 |
+| `PlatformResponse` | ワークフローの最終応答 (`status`: `allowed` / `denied` / `quota-exceeded` / `error`) |
 | `PolicyInput` | OPA への認可クエリ入力 |
 | `NotificationPayload` | 通知アクティビティへの入力 |
 | `RequestStatus` | DB に記録するリクエストステータス (`pending` / `denied` / `completed` / `failed`) |
+| `QuotaResult` | クォータチェック結果 (`allowed`, `current`, `limit`) |
 
 ### 4.4 workflows/platformWorkflow.ts — メインワークフロー
 
@@ -219,8 +258,10 @@ JSON 形式で stdout (info/debug/warn) / stderr (error) へ出力します。
 
 ```
 started → persisting → evaluating-policy
-  ├─ denied    → denied
-  └─ allowed   → processing → notifying → completed
+  ├─ denied          → denied
+  └─ allowed         → checking-quota
+        ├─ quota-exceeded → denied
+        └─ allowed       → processing → notifying → completed
 ```
 
 ### 4.5 activities/ — アクティビティ群
@@ -231,6 +272,15 @@ started → persisting → evaluating-policy
 - `AbortController` によるタイムアウト制御
 - 独自指数バックオフリトライ (1s, 2s, 3s…)
 - Temporal のリトライとの二重化を避けるため、アクティビティ内でリトライを完結させる設計
+- **Prometheus 計装**: `platform_opa_decisions_total{result}` カウンター + `platform_opa_decision_duration_seconds` ヒストグラム
+
+#### checkQuotaActivity (quotaActivity.ts) — NEW
+
+- Redis の Lua スクリプトで `INCR + EXPIRE` を**原子的**に実行し、スライディングウィンドウカウンターを実装
+- クォータ上限値の優先順位:
+  1. Redis の `quota_limit:{tenantId}:{resource}` キー (管理 API から動的変更可能)
+  2. 環境変数 `REDIS_DEFAULT_QUOTA_LIMIT` のデフォルト値
+- **Prometheus 計装**: `platform_quota_checks_total{result,resource}` カウンター
 
 #### processRequestActivity (activities/index.ts)
 
@@ -273,6 +323,106 @@ Readiness チェック対象 (初期実装): OPA `/health` エンドポイント
 | super-admin | `data.platform.users[userId].roles` に `"super-admin"` が含まれる |
 | テナント RBAC | ユーザーがテナントに所属 + ロールのパーミッションに `{action, resource}` が含まれる |
 | readonly_users | `action == "read"` + テナントの `readonly_users` リストに含まれる |
+
+### 4.9 metrics.ts — Prometheus メトリクス定義 — NEW
+
+`prom-client` のデフォルトレジストリを使用します。  
+`collectDefaultMetrics({ prefix: 'platform_nodejs_' })` で Node.js 標準メトリクス (CPU・ヒープ・GC・イベントループ遅延) も自動収集します。
+
+| メトリクス名 | 種別 | ラベル | 説明 |
+|---|---|---|---|
+| `platform_nats_messages_received_total` | Counter | `subject` | Gateway が受信したメッセージ数 |
+| `platform_nats_messages_acked_total` | Counter | — | 正常 ack したメッセージ数 |
+| `platform_nats_messages_nak_total` | Counter | — | nak (再配送依頼) したメッセージ数 |
+| `platform_nats_dlq_total` | Counter | — | DLQ 転送数 |
+| `platform_workflow_started_total` | Counter | `task_queue` | 起動したワークフロー数 |
+| `platform_opa_decisions_total` | Counter | `result` (allow/deny) | OPA 判定結果数 |
+| `platform_opa_decision_duration_seconds` | Histogram | — | OPA 判定レイテンシ |
+| `platform_quota_checks_total` | Counter | `result`, `resource` | クォータチェック結果数 |
+| `platform_redis_cache_hits_total` | Counter | `key_prefix` | Redis キャッシュヒット数 |
+| `platform_redis_cache_misses_total` | Counter | `key_prefix` | Redis キャッシュミス数 |
+| `platform_nodejs_*` | 各種 | — | Node.js 標準メトリクス |
+
+### 4.10 cache.ts — Redis クライアント & ユーティリティ — NEW
+
+`ioredis` を使用します。
+
+| 関数 | 説明 |
+|---|---|
+| `createRedisClient(url)` | Redis クライアントを生成 (指数バックオフ再接続) |
+| `checkAndIncrementQuota(...)` | Lua 原子操作でスライディングウィンドウクォータを管理 |
+| `getTenantQuotaLimit(...)` | Redis からテナント別クォータ上限を取得 |
+| `setTenantQuotaLimit(...)` | テナント別クォータ上限を設定 |
+| `cacheGet(...)` | キャッシュ取得 (ヒット/ミスをメトリクスに記録) |
+| `cacheSet(...)` | キャッシュ保存 (オプション TTL) |
+| `getServiceFlag(...)` | サービス間共有フラグの取得 |
+| `setServiceFlag(...)` | サービス間共有フラグの設定 |
+| `deleteServiceFlag(...)` | サービス間共有フラグの削除 |
+
+**Redis キー設計:**
+
+| キー | TTL | 説明 |
+|---|---|---|
+| `quota:{tenantId}:{userId}:{resource}` | `quotaWindowSeconds` | スライディングウィンドウカウンター |
+| `quota_limit:{tenantId}:{resource}` | 設定可能 (デフォルト 24h) | テナント別クォータ上限 |
+| `flag:{flagName}` | 設定可能 | サービス間共有フラグ |
+
+### 4.11 metricsServer.ts — Prometheus スクレイプエンドポイント — NEW
+
+`http` モジュールで軽量な HTTP サーバーを起動します。
+
+| エンドポイント | レスポンス | 説明 |
+|---|---|---|
+| `GET /metrics` | `200 text/plain; version=0.0.4` | Prometheus テキスト形式のメトリクス全件 |
+| その他 | `404` | — |
+
+---
+
+### 4.12 設定ファイル上の注意点 (既知の挙動) — NEW
+
+#### OPA: `--diagnostic-addr` フラグ
+
+OPA には `--metrics` という CLI フラグは存在しません。  
+Prometheus メトリクスを公開するには、`--diagnostic-addr` で専用の診断アドレスを指定します。
+
+```yaml
+# docker-compose.yaml (正)
+command:
+  - "run"
+  - "--server"
+  - "--addr=0.0.0.0:8181"         # 認可クエリ用 REST API
+  - "--diagnostic-addr=0.0.0.0:8282"  # /metrics, /health を公開
+```
+
+- ポート `8181` — 認可クエリ (`POST /v1/data/...`) 専用
+- ポート `8282` — `/metrics` (Prometheus) / `/health` (ヘルスチェック) 専用
+- Prometheus の `prometheus.yml` では OPA スクレイプ先を `opa:8282` と指定する
+
+#### Vector 0.38: YAML 内の環境変数展開
+
+Vector 0.38 は `${VARIABLE_NAME}` 構文を **コメント行 (`#` で始まる行) を含む YAML 全行** で評価します。  
+定義されていない環境変数が1つでも含まれると起動時にエラーになります。
+
+```yaml
+# NG: コメント内でも評価される
+# connection_string: ${VECTOR_PG_CONNECTION_STRING}
+
+# OK: リテラル文字列で記述する
+# connection_string: postgres://user:password@postgres:5432/platform
+```
+
+#### Vector 0.38 VRL: `merge()` の可不可
+
+VRL の `merge(target, source)` 関数は **可不可 (fallible)** です。  
+ターゲットの型が静的に `Object` と証明できない場合、エラーハンドリングが必要です。
+
+```vrl
+# NG: fallible — コンパイルエラー
+merge(., parsed)
+
+# OK: infallible variant — エラー時はパニック (処理を中断)
+merge!(., parsed)
+```
 
 ---
 
@@ -327,6 +477,14 @@ CREATE INDEX idx_platform_requests_tenant ON platform_requests(tenant_id, status
 }
 ```
 
+### 5.4 Redis データ構造 — NEW
+
+| キーパターン | 型 | 説明 | TTL |
+|---|---|---|---|
+| `quota:{tenantId}:{userId}:{resource}` | String (整数) | ウィンドウ内リクエスト数。Lua の `INCR` で原子的に加算 | `REDIS_QUOTA_WINDOW_SECS` |
+| `quota_limit:{tenantId}:{resource}` | String (整数) | テナント別クォータ上限値。管理 API 経由で設定 | 任意 (デフォルト 24h) |
+| `flag:{flagName}` | String | サービス間共有フラグ (例: `maintenance`, `feature-xyz`) | 任意 |
+
 ---
 
 ## 6. 非機能要件への対応
@@ -335,10 +493,11 @@ CREATE INDEX idx_platform_requests_tenant ON platform_requests(tenant_id, status
 |---|---|
 | **耐久性** | JetStream WorkQueue 保持 + Temporal イベントソーシング |
 | **冪等性** | workflowId = `platform-{requestId}` で重複起動防止 |
-| **可観測性** | JSON 構造化ログ (ts / level / component / requestId 相関) |
+| **可観測性** | JSON 構造化ログ (ts / level / component / requestId 相関) + Prometheus メトリクス + Vector ログ集約 |
+| **レート制限** | Redis スライディングウィンドウクォータ (テナント × ユーザー × リソース単位) |
 | **セキュリティ** | OPA default-deny RBAC、機密情報は環境変数で注入 |
 | **スケーラビリティ** | Worker の水平スケール対応 (TaskQueue 共有) |
-| **Graceful Shutdown** | SIGTERM → worker.shutdown() + nc.drain() |
+| **Graceful Shutdown** | SIGTERM → worker.shutdown() + nc.drain() + redis.quit() + メトリクスサーバー停止 |
 | **ヘルスチェック** | Liveness / Readiness 分離 (K8s Probe 対応) |
 
 ---

@@ -57,11 +57,67 @@ services:
   opa:
     image: openpolicyagent/opa:latest
     container_name: opa
-    command: ["run", "--server", "--log-level=debug", "--addr=0.0.0.0:8181"]
+    # --diagnostic-addr: /health と /metrics を別ポート (8282) で公開
+    # Prometheus は 8282/metrics をスクレイプする
+    command: ["run", "--server", "--log-level=info", "--addr=0.0.0.0:8181", "--diagnostic-addr=0.0.0.0:8282"]
     networks:
       - saas-platform
     ports:
-      - "8181:8181" # REST API用
+      - "8181:8181" # REST API
+      - "8282:8282" # /metrics, /health (Prometheus スクレイプ先)
+
+  # 6. Redis (クォータキャッシュ / サービス間フラグ共有)
+  redis:
+    image: redis:7-alpine
+    container_name: redis
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    networks:
+      - saas-platform
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+
+  # 7. Prometheus (メトリクス収集・時系列DB)
+  prometheus:
+    image: prom/prometheus:v2.51.0
+    container_name: prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.retention.time=15d"
+      - "--web.enable-lifecycle"      # PUT /-/reload でホットリロード可能
+    volumes:
+      - ./config/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    networks:
+      - saas-platform
+    ports:
+      - "9090:9090" # Prometheus UI / API
+    extra_hosts:
+      - "host.docker.internal:host-gateway" # ホスト上の platform メトリクスサーバーを参照
+
+  # 8. Vector (ログ集約・整形パイプライン)
+  vector:
+    image: timberio/vector:0.38.0-alpine
+    container_name: vector
+    command: ["--config", "/etc/vector/vector.yaml"]
+    volumes:
+      - ./config/vector.yaml:/etc/vector/vector.yaml:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro  # Docker ログ収集用
+    networks:
+      - saas-platform
+    ports:
+      - "8686:8686" # Vector API (監視・診断)
+      - "9001:9001" # HTTP ログ受信エンドポイント (platform → Vector)
+    depends_on:
+      - postgres
+
 networks:
   saas-platform:
     driver: bridge
+
+volumes:
+  redis-data:
+    driver: local
+  prometheus-data:
+    driver: local
