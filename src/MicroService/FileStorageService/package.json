@@ -4,7 +4,7 @@
   "type": "commonjs",
   "scripts": {
     "dev": "ts-node-dev --respawn --transpile-only src/index.ts",
-    "build": "tsc --ignoreDeprecations 5.0",
+    "build": "tsc",
     "start": "npm run build && node dist/index.js",
     "prisma:generate": "prisma generate",
     "prisma:migrate": "prisma migrate dev --name init"

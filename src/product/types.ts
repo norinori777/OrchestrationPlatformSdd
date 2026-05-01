@@ -28,10 +28,10 @@ export interface PlatformResponse {
 
 /** OPA ポリシー評価の入力 */
 export interface PolicyInput {
-  tenantId: string;
-  userId:   string;
-  action:   string;
-  resource: string;
+    tenantId: string;
+    userId:   string;
+    action:   string;
+    resource: string;
 }
 
 /** 通知アクティビティへのペイロード */
