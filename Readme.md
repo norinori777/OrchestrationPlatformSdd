@@ -220,6 +220,8 @@ npx ts-node src/product/policies/loadPolicy.ts
 npx ts-node src/product/index.ts
 ```
 
+Windows で SaaS フロント、バックエンド、マイクロサービス、オーケストレーションプラットフォームをまとめて起動する場合は、ルートの `start-all.bat` を使えます。`--dry-run` を付けると、実行されるコマンドだけを確認できます。
+
 NATS へのテストメッセージ送信例:
 ```json
 {
