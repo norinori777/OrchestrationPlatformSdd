@@ -1,8 +1,9 @@
 # DB 分離・トランザクション・状態管理 整合性設計書
 
 > 対象: オーケストレーションプラットフォーム全体  
-> バージョン: 1.0  
-> 作成日: 2026-05-01
+> バージョン: 1.1  
+> 作成日: 2026-05-01  
+> 更新日: 2026-05-01 — Saga 補償アクティビティ実装に伴い §3.3 / §4.2 / §4.4 / §6 / §7 を更新
 
 ---
 
@@ -106,15 +107,22 @@ await prisma.$transaction(async (tx) => {
 
 ```
 platformWorkflow
-  ├── persistRequestActivity(pending)      ← platform_requests に記録
-  ├── evaluatePolicyActivity               ← OPA (外部)
-  ├── checkQuotaActivity                   ← Redis (外部)
-  ├── processRequestActivity               ← UserService / FileStorageService へ HTTP
-  └── persistRequestActivity(completed)   ← platform_requests 更新
-                                             + SaaS Backend へコールバック (PATCH)
+  ├── persistRequestActivity(pending)          ← platform_requests に記録
+  ├── evaluatePolicyActivity                   ← OPA (外部)
+  │     └─ 拒否 → persistRequestActivity(denied) → 終了
+  ├── checkQuotaActivity                       ← Redis (外部)
+  │     └─ 超過 → persistRequestActivity(denied) → 終了
+  ├── [try]
+  │   ├── processRequestActivity               ← UserService / FileStorageService へ HTTP (業務副作用)
+  │   ├── sendNotificationActivity             ← 成功通知
+  │   └── persistRequestActivity(completed)   ← platform_requests 更新 + SaaS コールバック
+  └── [catch] 業務副作用発生後の失敗
+        ├── compensateRequestActivity          ← 作成済みリソースを DELETE で取り消し (create 系のみ)
+        └── persistRequestActivity(failed)    ← platform_requests 更新 + SaaS コールバック
 ```
 
-各ステップは Temporal のアクティビティとして実行され、失敗時は自動リトライされる。
+各ステップは Temporal のアクティビティとして実行され、失敗時は自動リトライされる。  
+`compensateRequestActivity` 自体も Temporal のリトライポリシーが適用されるため、補償操作の冪等性は 404 無視で担保する。
 
 **第 2 層: ベストエフォートコールバック**
 
@@ -158,15 +166,25 @@ try {
               │  (platform / saas 両方)│
               └───────────┬────────────┘
                           │
-          ┌───────────────┼───────────────┐
-          │               │               │
-          ▼               ▼               ▼
-       denied          denied           failed
-    (OPA 拒否)     (クォータ超過)     (キャンセル)
-                          │
-                          ▼
-                       completed
-                    (業務処理成功)
+          ┌───────────────┼───────────────────────┐
+          │               │                       │
+          ▼               ▼                       │
+       denied          denied                     │
+    (OPA 拒否)     (クォータ超過)                 │
+                                                  │ processRequestActivity 成功
+                          ┌───────────────────────┤
+                          │                       │
+                          ▼                       ▼
+                        failed                completed
+                  (例外 → Saga 補償済)      (業務処理成功)
+                  (キャンセル)
+```
+
+**failed への遷移詳細 (create 系):**
+```
+processRequestActivity 失敗 (例外)
+  → compensateRequestActivity  (作成済みリソースを DELETE)
+  → persistRequestActivity(failed)
 ```
 
 | ステータス | 設定タイミング | 設定場所 |
@@ -224,6 +242,8 @@ currentStatus = 'completed';
 | `processing` | 業務処理 (HTTP 呼び出し) 中 |
 | `notifying` | 通知送信中 |
 | `completed` | 完了 |
+| `compensating` | Saga 補償中 (create 失敗後に業務データを取り消し中) |
+| `failed` | 補償完了後の終端ステータス |
 
 ---
 
@@ -269,7 +289,8 @@ await prisma.file.create({ data: { id: req.requestId, ... } });
 | Temporal Activity 失敗 | 処理途中で停止 | 最大 3 回自動リトライ (指数バックオフ)。全失敗でワークフローが `failed` |
 | platform_requests upsert 失敗 | platform に記録なし | Activity リトライで再実行。upsert なので重複なし |
 | SaaS コールバック失敗 | saas_requests が `pending` のまま | ベストエフォート。platform_requests が正源なので整合性は保たれる。saas 側は最終的整合性 |
-| UserService / FileStorageService 障害 | 業務データ未反映 | Temporal がリトライ。リトライ上限後は `failed` でコールバック。PK 重複エラーは非リトライエラーに設定推奨 |
+| UserService / FileStorageService 障害 (create) | 業務データが部分的に作成済みの状態で停止 | Temporal がリトライ。リトライ上限後は `compensateRequestActivity` で作成済みリソースを DELETE (Saga 補償)。その後 `failed` を永続化。補償操作は 404 を成功扱いにするため冪等 |
+| UserService / FileStorageService 障害 (read/delete) | 補償操作なし | Temporal がリトライ。リトライ上限後は `failed` を永続化。read/delete は副作用なし、またはスナップショット未実装のため補償なし |
 | platform_requests と saas_requests の乖離 | saas 側ステータスが古い | platform_requests を正源として修復スクリプトで同期可能 |
 
 ---
@@ -281,5 +302,6 @@ await prisma.file.create({ data: { id: req.requestId, ... } });
 | スキーマ間のトランザクション不可 | Temporal ワークフローによる Saga パターンで補償 |
 | 状態の二重管理 | `platform_requests` を正源に一本化し、SaaS へはコールバックで同期 |
 | イベント再送・リトライ時の重複 | requestId を PK / workflowId に使い upsert / Temporal 重複排除で冪等化 |
-| 業務処理の部分失敗 | Temporal の自動リトライで最終整合性を実現 |
+| 業務処理の部分失敗 (create 系) | `compensateRequestActivity` で作成済みリソースを取り消し (Saga 補償)。その後 `failed` を永続化 |
+| 業務処理の部分失敗 (read/delete 系) | Temporal の自動リトライで最終整合性を実現。補償なし |
 | サービス境界の崩壊 | スキーマ間 SQL 禁止・API/イベント経由のみでデータ連携 |

@@ -7,7 +7,6 @@
 // 環境変数:
 //   OPA_BASE_URL (デフォルト: http://localhost:8181)
 // ─────────────────────────────────────────────────────────────────────────────
-import fetch from 'node-fetch';
 import { readFile } from 'fs/promises';
 import { fileURLToPath } from 'url';
 import path from 'path';

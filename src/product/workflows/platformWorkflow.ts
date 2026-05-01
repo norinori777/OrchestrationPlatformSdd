@@ -39,8 +39,20 @@ const {
     initialInterval:    '1 second',
     backoffCoefficient: 2,
     maximumInterval:    '30 seconds',
-    // ポリシー違反はリトライしない
-    nonRetryableErrorTypes: ['PolicyViolation'],
+    // ポリシー違反・PK 重複はリトライしない
+    nonRetryableErrorTypes: ['PolicyViolation', 'DuplicateRequestError'],
+  },
+});
+
+// 補償アクティビティプロキシ — より長いタイムアウトと多めのリトライ
+const { compensateRequestActivity } = proxyActivities<Pick<PlatformActivities, 'compensateRequestActivity'>>({
+  startToCloseTimeout: '60 seconds',
+  retry: {
+    maximumAttempts:    5,
+    initialInterval:    '2 seconds',
+    backoffCoefficient: 2,
+    maximumInterval:    '60 seconds',
+    nonRetryableErrorTypes: [],
   },
 });
 
@@ -149,23 +161,50 @@ export async function platformWorkflow(request: PlatformRequest): Promise<Platfo
     return response(request.requestId, 'error', 'Cancelled during processing');
   }
 
-  const result = await processRequestActivity(request);
+  try {
+    const result = await processRequestActivity(request);
 
-  // ── Step 5: 成功通知 + DB 更新 ────────────────────────────────────────
-  currentStatus = 'notifying';
-  await sendNotificationActivity({
-    tenantId:  request.tenantId,
-    userId:    request.userId,
-    requestId: request.requestId,
-    status:    'allowed',
-    message:   result,
-  });
+    // アクティビティ実行中にキャンセルシグナルが届いた場合
+    if (cancelled) {
+      await persistRequestActivity(request, 'failed', 'Cancelled during processing');
+      return response(request.requestId, 'error', 'Cancelled during processing');
+    }
 
-  await persistRequestActivity(request, 'completed', result);
-  currentStatus = 'completed';
+    // ── Step 5: 成功通知 + DB 更新 ────────────────────────────────────────
+    currentStatus = 'notifying';
+    await sendNotificationActivity({
+      tenantId:  request.tenantId,
+      userId:    request.userId,
+      requestId: request.requestId,
+      status:    'allowed',
+      message:   result,
+    });
 
-  log.info('Request completed', { requestId: request.requestId });
-  return response(request.requestId, 'allowed', result);
+    await persistRequestActivity(request, 'completed', result);
+    currentStatus = 'completed';
+
+    log.info('Request completed', { requestId: request.requestId });
+    return response(request.requestId, 'allowed', result);
+  } catch (err) {
+    const errorMessage = err instanceof Error ? err.message : String(err);
+    currentStatus = 'failed';
+    log.error('Workflow execution failed after side effects', {
+      requestId: request.requestId,
+      err: errorMessage,
+    });
+
+    if (request.action === 'create') {
+      currentStatus = 'compensating';
+      const compensationResult = await compensateRequestActivity(request);
+      log.warn('Saga compensation executed', {
+        requestId: request.requestId,
+        compensationResult,
+      });
+    }
+
+    await persistRequestActivity(request, 'failed', `Rolled back after failure: ${errorMessage}`);
+    return response(request.requestId, 'error', `Workflow failed: ${errorMessage}`);
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

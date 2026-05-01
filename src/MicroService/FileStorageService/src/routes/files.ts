@@ -1,9 +1,8 @@
 import { Router, Request, Response } from 'express';
-import { PrismaClient } from '@prisma/client';
 import * as yup from 'yup';
+import { prisma } from '../db';
 
 const router = Router();
-const prisma = new PrismaClient();
 
 const createSchema = yup.object({
   id:          yup.string().required(),
@@ -19,8 +18,10 @@ const createSchema = yup.object({
 router.post('/', async (req: Request, res: Response): Promise<void> => {
   try {
     const body = await createSchema.validate(req.body, { abortEarly: false });
-    const file = await prisma.file.create({
-      data: {
+    // upsert で冪等性を確保 (Temporal リトライ時に同一 id が再送されても安全)
+    const file = await prisma.file.upsert({
+      where: { id: body.id },
+      create: {
         id:          body.id,
         tenantId:    body.tenantId,
         userId:      body.userId,
@@ -29,6 +30,7 @@ router.post('/', async (req: Request, res: Response): Promise<void> => {
         size:        body.size ?? null,
         contentType: body.contentType ?? null,
       },
+      update: {},  // 既存レコードは変更しない
     });
     res.status(201).json(file);
   } catch (err) {

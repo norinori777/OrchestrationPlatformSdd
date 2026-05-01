@@ -114,6 +114,21 @@ services:
     depends_on:
       - postgres
 
+  # 9. Jaeger (分散トレーシング)
+  #    ・OTLP/HTTP (4318) でトレースを受信 (platform → Jaeger)
+  #    ・UI (16686) でトレースを可視化
+  jaeger:
+    image: jaegertracing/all-in-one:1.57
+    container_name: jaeger
+    environment:
+      - COLLECTOR_OTLP_ENABLED=true
+    networks:
+      - saas-platform
+    ports:
+      - "16686:16686" # Jaeger UI
+      - "4317:4317"   # OTLP gRPC
+      - "4318:4318"   # OTLP HTTP (platform の OTEL_EXPORTER_OTLP_ENDPOINT に合わせる)
+
 networks:
   saas-platform:
     driver: bridge

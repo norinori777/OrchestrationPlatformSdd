@@ -102,6 +102,37 @@ export const redisCacheMissesTotal = new Counter({
   labelNames: ['key_prefix'] as const,
 });
 
+// ── 通知アクティビティ メトリクス ────────────────────────────────────────────
+
+/** 正常に dispatch できた通知数 */
+export const notificationsSentTotal = new Counter({
+  name:       'platform_notifications_sent_total',
+  help:       'Total notifications successfully dispatched (NATS publish + webhook)',
+  labelNames: ['status'] as const,  // "allowed" | "denied" | "quota-exceeded" | "error"
+});
+
+/** dispatch に失敗した通知数 (ベストエフォートのため例外は飛ばさない) */
+export const notificationsFailedTotal = new Counter({
+  name:       'platform_notifications_failed_total',
+  help:       'Total notification dispatch failures (non-fatal, best-effort)',
+  labelNames: ['status'] as const,
+});
+
+// ── DLQ コンシューマー メトリクス ────────────────────────────────────────────
+
+/** DLQ から取り出して処理したメッセージ数 */
+export const dlqProcessedTotal = new Counter({
+  name: 'platform_dlq_processed_total',
+  help: 'Total DLQ messages processed by the DLQ consumer',
+});
+
+/** DLQ 警告 Webhook の送信結果 */
+export const dlqAlertSentTotal = new Counter({
+  name:       'platform_dlq_alert_sent_total',
+  help:       'Total DLQ alert webhook calls',
+  labelNames: ['result'] as const,  // "success" | "failure" | "error"
+});
+
 // デフォルトレジストリをエクスポート
 // metricsServer.ts から register.metrics() を呼び出して /metrics を公開する
 export { register as metricsRegistry };

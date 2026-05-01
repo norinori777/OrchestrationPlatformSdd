@@ -2,8 +2,10 @@
 // OPA ポリシー評価アクティビティ
 // ・指数バックオフ付きリトライ (Temporal のリトライと二重化しない設計)
 // ・タイムアウト付きフェッチ (AbortController)
+// ・OpenTelemetry スパン計装: opa.evaluate_policy
 // ─────────────────────────────────────────────────────────────────────────────
-import fetch from 'node-fetch';
+import { SpanStatusCode }                          from '@opentelemetry/api';
+import { getTracer }                               from '../telemetry.ts';
 import { opaDecisionsTotal, opaDecisionDurationSeconds } from '../metrics.ts';
 import type { Config }      from '../config.ts';
 import type { Logger }      from '../logger.ts';
@@ -14,8 +16,9 @@ function sleep(ms: number): Promise<void> {
 }
 
 export function createEvaluatePolicyActivity(config: Config, logger: Logger) {
-  const log = logger.child({ activity: 'evaluatePolicyActivity' });
-  const url = `${config.opa.baseUrl}/v1/data/${config.opa.policyPath}`;
+  const log    = logger.child({ activity: 'evaluatePolicyActivity' });
+  const tracer = getTracer('platform.opa');
+  const url    = `${config.opa.baseUrl}/v1/data/${config.opa.policyPath}`;
 
   return async function evaluatePolicyActivity(input: PolicyInput): Promise<boolean> {
     const actLog = log.child({
@@ -25,51 +28,80 @@ export function createEvaluatePolicyActivity(config: Config, logger: Logger) {
       resource: input.resource,
     });
 
-    for (let attempt = 1; attempt <= config.opa.maxRetries; attempt++) {
-      const controller = new AbortController();
-      const timer      = setTimeout(() => controller.abort(), config.opa.timeoutMs);
-      // レイテンシ計測開始 (endTimer() 呼び出し時にヒストグラムへ記録)
-      const endTimer   = opaDecisionDurationSeconds.startTimer();
+    return tracer.startActiveSpan('opa.evaluate_policy', async (span) => {
+      span.setAttributes({
+        'platform.tenant_id': input.tenantId,
+        'platform.user_id':   input.userId,
+        'platform.action':    input.action,
+        'platform.resource':  input.resource,
+        'rpc.system':         'opa',
+        'server.address':     config.opa.baseUrl,
+        'opa.policy_path':    config.opa.policyPath,
+      });
+
+      let lastAttempt = 0;
 
       try {
-        const res = await fetch(url, {
-          method:  'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body:    JSON.stringify({ input }),
-          // node-fetch の signal 型と AbortController の型が微妙にずれるため as unknown で回避
-          signal:  controller.signal as unknown as Parameters<typeof fetch>[1] extends { signal?: infer S } ? S : never,
-        });
+        for (let attempt = 1; attempt <= config.opa.maxRetries; attempt++) {
+          lastAttempt = attempt;
+          const controller = new AbortController();
+          const timer      = setTimeout(() => controller.abort(), config.opa.timeoutMs);
+          const endTimer   = opaDecisionDurationSeconds.startTimer();
 
-        clearTimeout(timer);
+          try {
+            const res = await fetch(url, {
+              method:  'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body:    JSON.stringify({ input }),
+              signal:  controller.signal,
+            });
 
-        if (!res.ok) {
-          const body = await res.text();
-          throw new Error(`OPA HTTP ${res.status}: ${body}`);
+            clearTimeout(timer);
+
+            if (!res.ok) {
+              const body = await res.text();
+              throw new Error(`OPA HTTP ${res.status}: ${body}`);
+            }
+
+            const json = (await res.json()) as { result?: unknown };
+            const allowed = Boolean(json.result);
+
+            opaDecisionsTotal.inc({ result: allowed ? 'allow' : 'deny' });
+            endTimer();
+
+            span.setAttributes({
+              'opa.result':      allowed ? 'allow' : 'deny',
+              'opa.attempt_count': attempt,
+            });
+            span.setStatus({ code: SpanStatusCode.OK });
+            actLog.info('Policy evaluated', { allowed, attempt });
+            span.end();
+            return allowed;
+          } catch (err: unknown) {
+            clearTimeout(timer);
+            const msg = err instanceof Error ? err.message : String(err);
+
+            if (attempt >= config.opa.maxRetries) {
+              actLog.error('Policy evaluation failed after all retries', { msg, attempt });
+              throw new Error(`OPA evaluation failed: ${msg}`);
+            }
+
+            actLog.warn('Policy evaluation retry', { msg, attempt });
+            await sleep(1_000 * attempt);
+          }
         }
 
-        const json = (await res.json()) as { result?: unknown };
-        const allowed = Boolean(json.result);
-
-        // ── Prometheus メトリクスを記録 ────────────────────────────────────────
-        opaDecisionsTotal.inc({ result: allowed ? 'allow' : 'deny' });
-        endTimer();
-
-        actLog.info('Policy evaluated', { allowed, attempt });
-        return allowed;
+        throw new Error('Unreachable');
       } catch (err: unknown) {
-        clearTimeout(timer);
-        const msg = err instanceof Error ? err.message : String(err);
-
-        if (attempt >= config.opa.maxRetries) {
-          actLog.error('Policy evaluation failed after all retries', { msg, attempt });
-          throw new Error(`OPA evaluation failed: ${msg}`);
-        }
-
-        actLog.warn('Policy evaluation retry', { msg, attempt });
-        await sleep(1_000 * attempt); // 指数バックオフ (1s, 2s, 3s…)
+        span.setAttributes({ 'opa.attempt_count': lastAttempt });
+        span.recordException(err as Error);
+        span.setStatus({
+          code:    SpanStatusCode.ERROR,
+          message: err instanceof Error ? err.message : String(err),
+        });
+        span.end();
+        throw err;
       }
-    }
-
-    throw new Error('Unreachable');
+    });
   };
 }

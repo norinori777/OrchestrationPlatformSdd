@@ -16,6 +16,8 @@ import {
   RetentionPolicy,
 } from 'nats';
 import { Connection, WorkflowClient } from '@temporalio/client';
+import { SpanStatusCode }              from '@opentelemetry/api';
+import { getTracer }                   from './telemetry.ts';
 import { platformWorkflow } from './workflows/platformWorkflow.ts';
 import {
   natsMessagesReceivedTotal,
@@ -24,8 +26,8 @@ import {
   natsDlqTotal,
   workflowStartedTotal,
 } from './metrics.ts';
-import type { Config } from './config.ts';
-import type { Logger } from './logger.ts';
+import type { Config }          from './config.ts';
+import type { Logger }          from './logger.ts';
 import type { PlatformRequest } from './types.ts';
 
 export async function startGateway(
@@ -66,6 +68,21 @@ export async function startGateway(
     log.info('JetStream stream already exists (or updated)', { stream: config.nats.streamName });
   }
 
+  // ── DLQ JetStream ストリームを冪等に作成 ─────────────────────────────
+  // DLQ コンシューマーが起動していない間もメッセージを保持するために JetStream を使用
+  try {
+    await jsm.streams.add({
+      name:     config.nats.dlqStreamName,
+      subjects: [config.nats.dlqSubject],
+      // DLQ メッセージは 7 日間保持して手動調査・再処理に利用
+      max_age:  7 * 24 * 60 * 60 * 1_000_000_000,
+      max_msgs: 100_000,
+    });
+    log.info('DLQ JetStream stream created', { stream: config.nats.dlqStreamName });
+  } catch {
+    log.info('DLQ JetStream stream already exists', { stream: config.nats.dlqStreamName });
+  }
+
   // ── 耐久コンシューマーを冪等に作成 ──────────────────────────────────
   try {
     await jsm.consumers.add(config.nats.streamName, {
@@ -95,6 +112,8 @@ export async function startGateway(
   }, { once: true });
 
   // ── メッセージ処理ループ ──────────────────────────────────────────────
+  const tracer = getTracer('platform.gateway');
+
   for await (const msg of messages) {
     const msgLog = log.child({ subject: msg.subject, seq: msg.seq });
 
@@ -109,8 +128,12 @@ export async function startGateway(
     } catch (err: unknown) {
       const errMsg = err instanceof Error ? err.message : String(err);
       msgLog.error('Malformed message, sending to DLQ', { errMsg });
-      // 不正形式のメッセージは DLQ に転送して ack (リトライしない)
-      nc.publish(config.nats.dlqSubject, msg.data);
+      // 不正形式のメッセージは DLQ JetStream に転送して ack (リトライしない)
+      try {
+        await js.publish(config.nats.dlqSubject, msg.data);
+      } catch (dlqErr) {
+        msgLog.error('Failed to publish to DLQ stream', { err: String(dlqErr) });
+      }
       natsDlqTotal.inc();
       msg.ack();
       continue;
@@ -120,39 +143,58 @@ export async function startGateway(
     reqLog.info('Received platform event');
     natsMessagesReceivedTotal.inc({ subject: msg.subject });
 
-    // ── Temporal ワークフロー起動 ─────────────────────────────────────
-    try {
-      const handle = await client.start(platformWorkflow, {
-        args:       [request],
-        taskQueue:  config.temporal.taskQueue,
-        // requestId をワークフロー ID に使うことで冪等性を保証
-        workflowId: `platform-${request.requestId}`,
+    // ── Temporal ワークフロー起動 (スパン計装) ────────────────────────
+    await tracer.startActiveSpan('nats.message.process', async (span) => {
+      span.setAttributes({
+        'messaging.system':           'nats',
+        'messaging.destination':      msg.subject,
+        'messaging.message.sequence': msg.seq,
+        'platform.request_id':        request.requestId,
+        'platform.tenant_id':         request.tenantId,
+        'platform.action':            request.action,
+        'platform.resource':          request.resource,
       });
 
-      reqLog.info('Workflow started', { workflowId: handle.workflowId });
-      workflowStartedTotal.inc({ task_queue: config.temporal.taskQueue });
-      natsMessagesAckedTotal.inc();
-      msg.ack();
-    } catch (err: unknown) {
-      const errMsg = err instanceof Error ? err.message : String(err);
+      try {
+        const handle = await client.start(platformWorkflow, {
+          args:       [request],
+          taskQueue:  config.temporal.taskQueue,
+          // requestId をワークフロー ID に使うことで冪等性を保証
+          workflowId: `platform-${request.requestId}`,
+        });
 
-      // ワークフローが既に起動済み → 冪等 ack
-      if (
-        errMsg.includes('already started') ||
-        errMsg.includes('already exists')  ||
-        errMsg.includes('WorkflowExecutionAlreadyStarted')
-      ) {
-        reqLog.warn('Duplicate request — workflow already running, acking', { errMsg });
+        reqLog.info('Workflow started', { workflowId: handle.workflowId });
+        workflowStartedTotal.inc({ task_queue: config.temporal.taskQueue });
         natsMessagesAckedTotal.inc();
+        span.setAttribute('temporal.workflow_id', handle.workflowId);
+        span.setStatus({ code: SpanStatusCode.OK });
         msg.ack();
-        continue;
+      } catch (err: unknown) {
+        const errMsg = err instanceof Error ? err.message : String(err);
+
+        // ワークフローが既に起動済み → 冪等 ack
+        if (
+          errMsg.includes('already started') ||
+          errMsg.includes('already exists')  ||
+          errMsg.includes('WorkflowExecutionAlreadyStarted')
+        ) {
+          reqLog.warn('Duplicate request — workflow already running, acking', { errMsg });
+          natsMessagesAckedTotal.inc();
+          span.setStatus({ code: SpanStatusCode.OK });
+          span.setAttribute('gateway.duplicate', true);
+          msg.ack();
+        } else {
+          reqLog.error('Failed to start workflow, will retry', { errMsg });
+          natsMessagesNakTotal.inc();
+          span.recordException(err as Error);
+          span.setStatus({ code: SpanStatusCode.ERROR, message: errMsg });
+          // JetStream が ackWait 後に再配送する
+          msg.nak(5_000); // 5 秒後に再配送をリクエスト
+        }
       }
 
-      reqLog.error('Failed to start workflow, will retry', { errMsg });
-      natsMessagesNakTotal.inc();
-      // JetStream が ackWait 後に再配送する
-      msg.nak(5_000); // 5 秒後に再配送をリクエスト
-    }
+      span.end();
+    });
   }
 
   // ── クリーンアップ ────────────────────────────────────────────────────

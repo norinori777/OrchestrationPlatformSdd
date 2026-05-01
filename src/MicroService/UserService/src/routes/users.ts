@@ -1,9 +1,8 @@
 import { Router, Request, Response } from 'express';
-import { PrismaClient } from '@prisma/client';
 import * as yup from 'yup';
+import { prisma } from '../db';
 
 const router = Router();
-const prisma = new PrismaClient();
 
 const createSchema = yup.object({
   id:       yup.string().required(),
@@ -17,19 +16,27 @@ const createSchema = yup.object({
 router.post('/', async (req: Request, res: Response): Promise<void> => {
   try {
     const body = await createSchema.validate(req.body, { abortEarly: false });
-    const user = await prisma.serviceUser.create({
-      data: {
+    // upsert で冪等性を確保 (Temporal リトライ時に同一 id が再送されても安全)
+    const user = await prisma.serviceUser.upsert({
+      where: { id: body.id },
+      create: {
         id:       body.id,
         tenantId: body.tenantId,
         email:    body.email,
         name:     body.name,
         role:     body.role ?? 'viewer',
       },
+      update: {},  // 既存レコードは変更しない
     });
     res.status(201).json(user);
   } catch (err) {
     if (err instanceof yup.ValidationError) {
       res.status(400).json({ error: err.errors });
+      return;
+    }
+    // P2002: tenantId + email のユニーク制約違反
+    if ((err as any)?.code === 'P2002') {
+      res.status(409).json({ error: 'User with this email already exists in the tenant' });
       return;
     }
     console.error(err);

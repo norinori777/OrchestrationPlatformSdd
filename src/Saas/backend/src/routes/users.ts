@@ -2,10 +2,9 @@ import { Router, Request, Response } from 'express';
 import { v4 as uuidv4 } from 'uuid';
 import * as yup from 'yup';
 import { publishEvent } from '../natsClient';
-import { PrismaClient } from '@prisma/client';
+import { prisma } from '../db';
 
 const router = Router();
-const prisma = new PrismaClient();
 
 const createUserSchema = yup.object({
   tenantId: yup.string().required(),

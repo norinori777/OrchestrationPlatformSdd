@@ -1,10 +1,9 @@
 // プラットフォームからの状態コールバックを受け取るルーター
 // PATCH /api/requests/:requestId/status  { status, result? }
 import { Router, Request, Response } from 'express';
-import { PrismaClient } from '@prisma/client';
+import { prisma } from '../db';
 
 const router = Router();
-const prisma = new PrismaClient();
 
 const ALLOWED_STATUSES = ['pending', 'denied', 'completed', 'failed'] as const;
 type AllowedStatus = typeof ALLOWED_STATUSES[number];

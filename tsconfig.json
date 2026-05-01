@@ -8,8 +8,8 @@
     // Environment Settings
     // See also https://aka.ms/tsconfig/module
     "module": "es2020",
-    "target": "es2020",
-    "types": [],
+    "target": "es2022",
+    "types": ["vitest/globals"],
     "noEmit": true,
     "allowImportingTsExtensions": true,
     // For nodejs:
@@ -44,5 +44,7 @@
     "skipLibCheck": true,
 
     "esModuleInterop": true,
-  }
+    "moduleResolution": "bundler"
+  },
+  "include": ["src/product/**/*"]
 }

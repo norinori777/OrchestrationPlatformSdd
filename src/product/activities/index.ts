@@ -7,10 +7,15 @@ import type { Config } from '../config.ts';
 import type { Logger } from '../logger.ts';
 import type { PlatformRequest, PolicyInput, NotificationPayload, RequestStatus, QuotaResult } from '../types.ts';
 import type Redis from 'ioredis';
+import type { NatsConnection } from 'nats';
+import { SpanStatusCode }                        from '@opentelemetry/api';
+import { getTracer }                             from '../telemetry.ts';
 import { createEvaluatePolicyActivity }   from './opaActivity.ts';
 import { createSendNotificationActivity } from './notificationActivity.ts';
 import { createPersistRequestActivity }   from './persistenceActivity.ts';
 import { createCheckQuotaActivity }       from './quotaActivity.ts';
+// @ts-ignore — カスタム出力パスから生成された Prisma Client
+import { PrismaClient } from '../../../node_modules/.prisma/product-client/index.js';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // マイクロサービス接続先 (環境変数で上書き可)
@@ -19,6 +24,8 @@ const FILE_STORAGE_URL = process.env.FILE_STORAGE_SERVICE_URL ?? 'http://localho
 const USER_SERVICE_URL = process.env.USER_SERVICE_URL         ?? 'http://localhost:4002';
 
 type RequestHandler = (request: PlatformRequest) => Promise<string>;
+
+type CompensationHandler = (request: PlatformRequest) => Promise<string>;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // ハンドラマップ — action:resource → マイクロサービス HTTP 委譲
@@ -97,6 +104,30 @@ const handlers: Record<string, RequestHandler> = {
   },
 };
 
+const compensationHandlers: Record<string, CompensationHandler> = {
+  'create:files': async (req) => {
+    const res = await fetch(`${FILE_STORAGE_URL}/api/files/${encodeURIComponent(req.requestId)}`, {
+      method:  'DELETE',
+      headers: { 'X-Tenant-Id': req.tenantId },
+      signal:  AbortSignal.timeout(10_000),
+    });
+    if (res.status === 404) return `File compensation skipped: id=${req.requestId} was already absent`;
+    if (!res.ok) throw new Error(`FileStorageService compensation DELETE: HTTP ${res.status}`);
+    return `File compensation completed: id=${req.requestId}`;
+  },
+
+  'create:users': async (req) => {
+    const res = await fetch(`${USER_SERVICE_URL}/api/users/${encodeURIComponent(req.requestId)}`, {
+      method:  'DELETE',
+      headers: { 'X-Tenant-Id': req.tenantId },
+      signal:  AbortSignal.timeout(10_000),
+    });
+    if (res.status === 404) return `User compensation skipped: id=${req.requestId} was already absent`;
+    if (!res.ok) throw new Error(`UserService compensation DELETE: HTTP ${res.status}`);
+    return `User compensation completed: id=${req.requestId}`;
+  },
+};
+
 // ─────────────────────────────────────────────────────────────────────────────
 // ドメインロジック アクティビティ
 // ─────────────────────────────────────────────────────────────────────────────
@@ -104,18 +135,78 @@ async function processRequestActivity(request: PlatformRequest): Promise<string>
   const key     = `${request.action}:${request.resource}`;
   const handler = handlers[key];
   if (!handler) throw new Error(`No handler registered for "${key}"`);
-  return handler(request);
+
+  const tracer = getTracer('platform.process');
+  return tracer.startActiveSpan(`process.${key}`, async (span) => {
+    span.setAttributes({
+      'platform.request_id': request.requestId,
+      'platform.tenant_id':  request.tenantId,
+      'platform.action':     request.action,
+      'platform.resource':   request.resource,
+      'http.request.method': request.action === 'read' ? 'GET'
+                           : request.action === 'delete' ? 'DELETE' : 'POST',
+    });
+    try {
+      const result = await handler(request);
+      span.setStatus({ code: SpanStatusCode.OK });
+      span.end();
+      return result;
+    } catch (err: unknown) {
+      span.recordException(err as Error);
+      span.setStatus({
+        code:    SpanStatusCode.ERROR,
+        message: err instanceof Error ? err.message : String(err),
+      });
+      span.end();
+      throw err;
+    }
+  });
+}
+
+async function compensateRequestActivity(request: PlatformRequest): Promise<string> {
+  const key     = `${request.action}:${request.resource}`;
+  const handler = compensationHandlers[key];
+  if (!handler) {
+    return `No compensation registered for "${key}"`;
+  }
+
+  const tracer = getTracer('platform.compensate');
+  return tracer.startActiveSpan(`compensate.${key}`, async (span) => {
+    span.setAttributes({
+      'platform.request_id': request.requestId,
+      'platform.tenant_id':  request.tenantId,
+      'platform.action':     request.action,
+      'platform.resource':   request.resource,
+      'http.request.method': 'DELETE',
+    });
+    try {
+      const result = await handler(request);
+      span.setStatus({ code: SpanStatusCode.OK });
+      span.end();
+      return result;
+    } catch (err: unknown) {
+      span.recordException(err as Error);
+      span.setStatus({
+        code:    SpanStatusCode.ERROR,
+        message: err instanceof Error ? err.message : String(err),
+      });
+      span.end();
+      throw err;
+    }
+  });
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // ファクトリ — config/logger を DI してワーカーへ渡すオブジェクトを生成
 // ─────────────────────────────────────────────────────────────────────────────
-export function createActivities(config: Config, logger: Logger, redis: Redis) {
+export function createActivities(config: Config, logger: Logger, redis: Redis, nc: NatsConnection) {
+  const prisma = new PrismaClient();
   return {
     evaluatePolicyActivity:   createEvaluatePolicyActivity(config, logger),
-    sendNotificationActivity: createSendNotificationActivity(config, logger),
-    persistRequestActivity:   createPersistRequestActivity(config, logger),
+    sendNotificationActivity: createSendNotificationActivity(config, logger, nc),
+    persistRequestActivity:   createPersistRequestActivity(config, logger, prisma),
     checkQuotaActivity:       createCheckQuotaActivity(config, logger, redis),
+    compensateRequestActivity,
     processRequestActivity,
   };
 }
@@ -124,6 +215,7 @@ export function createActivities(config: Config, logger: Logger, redis: Redis) {
 export type PlatformActivities = {
   evaluatePolicyActivity(input: PolicyInput): Promise<boolean>;
   processRequestActivity(request: PlatformRequest): Promise<string>;
+  compensateRequestActivity(request: PlatformRequest): Promise<string>;
   sendNotificationActivity(payload: NotificationPayload): Promise<void>;
   persistRequestActivity(request: PlatformRequest, status: RequestStatus, result?: string): Promise<void>;
   checkQuotaActivity(request: PlatformRequest): Promise<QuotaResult>;

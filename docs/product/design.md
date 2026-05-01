@@ -1,10 +1,12 @@
 # オーケストレーションプラットフォーム 設計書
 
 > 対象ディレクトリ: `src/product/`  
-> バージョン: 1.2  
+> バージョン: 1.4  
 > 作成日: 2026-04-30  
 > 改訂日: 2026-04-30 (v1.1 — Prometheus / Vector / Redis 追加)  
-> 改訂日: 2026-04-30 (v1.2 — OPA diagnostic-addr / Vector VRL 修正)
+> 改訂日: 2026-04-30 (v1.2 — OPA diagnostic-addr / Vector VRL 修正)  
+> 改訂日: 2026-05-01 (v1.3 — 通知アクティビティ本実装 + DLQ コンシューマー追加)  
+> 改訂日: 2026-05-01 (v1.4 — ヘルスチェック充実 / PK重複非リトライ / 設定バリデーション / 補償ポリシー分離 / node-fetch 除去 / PrismaClient DI)
 
 ---
 
@@ -177,6 +179,8 @@ Temporal がワークフロー開始
 | キャンセルシグナル | `cancel` Signal 受信 → `persistRequestActivity("failed")` → 終了 |
 | Redis 接続失敗 | `checkQuotaActivity` が Temporal によりリトライ (max 3 回) |
 | クォータ超過 | `checkQuotaActivity` が `allowed=false` → quota-exceeded パスへ遷移 |
+| **PK 重複 (P2002)** | `DuplicateRequestError` をスロー → Temporal が**リトライしない** (非リトライエラー) |
+| **補償処理失敗** | 補償アクティビティ専用ポリシー (最大 5 回、60 秒タイムアウト) で独立リトライ |
 
 ---
 
@@ -185,7 +189,15 @@ Temporal がワークフロー開始
 ### 4.1 config.ts — 設定管理
 
 環境変数から設定を読み込み、型付き `Config` オブジェクトを返します。  
-数値変換に失敗した場合は起動時に即座にエラーをスローします（フェイルファスト）。
+数値変換に失敗した場合は起動時に即座にエラーをスローします（フェイルファスト）。  
+**v1.4 から `validateConfig()` を追加。** `loadConfig()` 末尾で呼び出し、以下の条件を検査します。検査に失敗すると起動前に `Error` をスローします。
+
+| 検査対象 | 条件 |
+|---|---|
+| URL 形式フィールド | `new URL()` でパース可能なこと (opa.baseUrl / redis.url / saasBackendUrl / notification.webhookUrl) |
+| ポート番号 | 1〜65535 の整数 (health.port / metrics.port) |
+| 必須文字列 | 空文字列でないこと (temporal.address/namespace/taskQueue / nats.servers/streamName/dlqStreamName) |
+| 正の整数 | ≥1 であること (nats.maxDeliver / opa.timeoutMs / opa.maxRetries / redis.quotaWindowSeconds / redis.defaultQuotaLimit / notification.webhookTimeoutMs) |
 
 | 環境変数 | デフォルト | 説明 |
 |---|---|---|
@@ -197,6 +209,7 @@ Temporal がワークフロー開始
 | `NATS_SUBJECTS` | `platform.events.>` | サブスクライブ subject (カンマ区切り) |
 | `NATS_CONSUMER_NAME` | `platform-worker` | 耐久コンシューマー名 |
 | `NATS_DLQ_SUBJECT` | `platform.dlq` | Dead Letter Queue subject |
+| `NATS_DLQ_STREAM_NAME` | `PLATFORM-DLQ` | DLQ JetStream ストリーム名 |
 | `NATS_MAX_DELIVER` | `3` | 最大再配送回数 |
 | `NATS_ACK_WAIT_SECS` | `30` | Ack タイムアウト (秒) |
 | `OPA_BASE_URL` | `http://localhost:8181` | OPA REST API ベース URL |
@@ -264,11 +277,36 @@ started → persisting → evaluating-policy
         └─ allowed       → processing → notifying → completed
 ```
 
+#### アクティビティリトライポリシー (v1.4 更新)
+
+**通常アクティビティ** (`proxyActivities` ブロック 1):
+
+| 設定項目 | 値 |
+|---|---|
+| `startToCloseTimeout` | 30 秒 |
+| `maximumAttempts` | 3 |
+| `initialInterval` | 1 秒 |
+| `backoffCoefficient` | 2 |
+| `maximumInterval` | 30 秒 |
+| `nonRetryableErrorTypes` | `['PolicyViolation', 'DuplicateRequestError']` |
+
+**補償アクティビティ** (`compensateRequestActivity` — `proxyActivities` ブロック 2):
+
+| 設定項目 | 値 | 理由 |
+|---|---|---|
+| `startToCloseTimeout` | **60 秒** | 補償処理は外部 API 呼び出しが含まれるため長めに設定 |
+| `maximumAttempts` | **5** | 補償はビジネス的に重要なため通常より多くリトライ |
+| `initialInterval` | 2 秒 | |
+| `backoffCoefficient` | 2 | |
+| `maximumInterval` | 60 秒 | |
+| `nonRetryableErrorTypes` | `[]` | 補償はあらゆるエラーでリトライする |
+
 ### 4.5 activities/ — アクティビティ群
 
 #### evaluatePolicyActivity (opaActivity.ts)
 
 - OPA REST API `POST /v1/data/{policyPath}` を呼び出す
+- **Node.js 18+ グローバル `fetch` を使用** (v1.4 で `node-fetch` 依存を除去)
 - `AbortController` によるタイムアウト制御
 - 独自指数バックオフリトライ (1s, 2s, 3s…)
 - Temporal のリトライとの二重化を避けるため、アクティビティ内でリトライを完結させる設計
@@ -289,13 +327,16 @@ started → persisting → evaluating-policy
 
 #### sendNotificationActivity (notificationActivity.ts)
 
-- 実装は差し替え可能なスタブ構造
-- Webhook / SendGrid / Slack Incoming Webhook 等に置き換える
+- NATS パブリッシュ (`platform.notifications.{tenantId}`) + HTTP Webhook の 2 バックエンドへ**ベストエフォート**配信
+- 詳細は「8. 通知アクティビティ実装」を参照
 
 #### persistRequestActivity (persistenceActivity.ts)
 
-- PostgreSQL `UPSERT` の SQL 雛形を内包
-- `pg` パッケージを追加して実装する
+- Prisma ORM (`@prisma/client` カスタム出力パス) を使用して PostgreSQL へ UPSERT
+- **v1.4: `PrismaClient` を DI に変更** — モジュールレベルの `const prisma = new PrismaClient()` を廃止し、`createPersistRequestActivity(config, logger, prisma)` のパラメータとして受け取る。これによりユニットテストでモックの注入が容易になった
+- **v1.4: `DuplicateRequestError` を追加** — Prisma エラーコード `P2002` (Unique constraint violation) を検出して `DuplicateRequestError` に変換してスロー。Temporal の `nonRetryableErrorTypes` に登録することで不必要なリトライを防ぐ
+- SaaS Backend の `PATCH /api/requests/{requestId}/status` へステータスをコールバック (ベストエフォート)
+- **OTel スパン**: `db.persist_request` + `http.saas_callback`
 
 ### 4.6 gateway.ts — NATS → Temporal ゲートウェイ
 
@@ -311,8 +352,26 @@ started → persisting → evaluating-policy
 | `GET /health/live` | 200 `{"status":"ok"}` | — | K8s Liveness Probe |
 | `GET /health/ready` | 200 `{"status":"ok","checks":{...}}` | 503 `{"status":"degraded",...}` | K8s Readiness Probe |
 
-Readiness チェック対象 (初期実装): OPA `/health` エンドポイント疎通確認  
-追加チェック例: Temporal 接続確認・PostgreSQL ping
+**v1.4 で Readiness チェックを充実させた。** 現在の実装済みチェック対象:
+
+| チェック名 | 確認内容 | タイムアウト |
+|---|---|---|
+| `opa` | `GET {OPA_BASE_URL}/health` が 200 を返すか | 2 秒 |
+| `redis` | `redis.ping()` が `PONG` を返すか | ioredis デフォルト |
+| `nats` | `notifNc.isClosed() === false` か | 同期 |
+| `temporal` | `Connection.connect()` → `getSystemInfo()` が成功するか | gRPC デフォルト |
+
+レスポンス例:
+
+```json
+// 全チェック成功 → 200
+{ "status": "ok", "checks": { "opa": true, "redis": true, "nats": true, "temporal": true } }
+
+// temporal 障害 → 503
+{ "status": "degraded", "checks": { "opa": true, "redis": true, "nats": true, "temporal": false } }
+```
+
+> **K8s 設定推奨**: Readiness チェックの `failureThreshold` は 2〜3 に設定し、一時的な障害でトラフィックが即座に切り離されないようにしてください。
 
 ### 4.8 policies/platform.rego — OPA RBAC ポリシー
 
@@ -670,138 +729,53 @@ return async function sendNotificationActivity(payload: NotificationPayload): Pr
 
 ---
 
-### 7.3 DB 永続化の有効化 (`persistRequestActivity`)
+### 7.3 DB 永続化 (`persistRequestActivity`) — **v1.4 実装済み**
 
 **対象ファイル:** `src/product/activities/persistenceActivity.ts`
 
-#### 手順
+v1.4 で Prisma ORM (`@prisma/client` カスタム出力) を使った完全実装に移行した。
 
-**Step 1: パッケージを追加する**
+#### 主な変更点
 
-```bash
-npm install pg
-npm install -D @types/pg
-```
+- `PrismaClient` を DI パラメータで受け取るよう変更。`createActivities()` が `new PrismaClient()` を生成して渡す
+- Prisma エラーコード `P2002` (Unique constraint) を `DuplicateRequestError` に変換し、Temporal の `nonRetryableErrorTypes` に登録
+- SaaS Backend の `PATCH /api/requests/{requestId}/status` へステータスをコールバック (ベストエフォート)
 
-**Step 2: 接続プールを初期化する**
+#### DuplicateRequestError の設計根拠
 
-```typescript
-import pg from 'pg';
-
-// モジュールスコープでプールを一度だけ生成する
-// (Worker プロセス内で共有される)
-const pool = new pg.Pool({
-  connectionString: process.env.DATABASE_URL,
-  // 実運用推奨設定
-  max:              10,   // 最大接続数
-  idleTimeoutMillis: 30_000,
-  connectionTimeoutMillis: 2_000,
-});
-```
-
-**Step 3: UPSERT SQL を有効化する**
+同一 `requestId` が 2 回到達するケース (NATS の重複配信) では、2 回目の upsert が PK 制約エラー (`P2002`) を引き起こす可能性がある。  
+これはリトライしても解消しないため、`DuplicateRequestError` を `nonRetryableErrorTypes` に登録し、Temporal がリトライを試みないようにしている。
 
 ```typescript
-export function createPersistRequestActivity(_config: Config, logger: Logger) {
-  return async function persistRequestActivity(
-    request: PlatformRequest,
-    status: RequestStatus,
-  ): Promise<void> {
-    await pool.query(
-      `INSERT INTO platform_requests
-         (id, tenant_id, user_id, action, resource, status, created_at, updated_at)
-       VALUES ($1, $2, $3, $4, $5, $6, NOW(), NOW())
-       ON CONFLICT (id)
-       DO UPDATE SET status = $6, updated_at = NOW()`,
-      [
-        request.requestId,
-        request.tenantId,
-        request.userId,
-        request.action,
-        request.resource,
-        status,
-      ],
-    );
-  };
+export class DuplicateRequestError extends Error {
+  constructor(requestId: string) {
+    super(`Duplicate request ID: ${requestId}`);
+    this.name = 'DuplicateRequestError';
+  }
 }
-```
-
-**Step 4: 環境変数を設定する**
-
-```bash
-export DATABASE_URL=postgresql://temporal:temporal@localhost:5432/temporal
-```
-
-#### DB スキーマ (再掲)
-
-```sql
-CREATE TABLE platform_requests (
-    id          TEXT        PRIMARY KEY,
-    tenant_id   TEXT        NOT NULL,
-    user_id     TEXT        NOT NULL,
-    action      TEXT        NOT NULL,
-    resource    TEXT        NOT NULL,
-    status      TEXT        NOT NULL,  -- pending / denied / completed / failed
-    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-
-CREATE INDEX idx_platform_requests_tenant ON platform_requests(tenant_id, status);
 ```
 
 #### 注意事項
 
 - `ON CONFLICT DO UPDATE` により、Temporal のリトライで同じリクエストが再実行されても安全です（冪等）。
-- プールはモジュールスコープで一度だけ生成します。アクティビティ関数の中で毎回 `new pg.Pool()` しないでください。
+- `PrismaClient` のインスタンスは `createActivities()` で 1 つだけ生成されます。アクティビティ関数の中で毎回生成しないでください。
 
 ---
 
-### 7.4 Readiness チェックの追加 (`healthServer`)
+### 7.4 Readiness チェック (`healthServer`) — **v1.4 実装済み**
 
 **対象ファイル:** `src/product/index.ts`
 
-#### 現在の構造
+v1.4 で `opa` チェックのみから 4 チェックに充実した。実装済みの内容は **4.7 healthServer.ts** セクションを参照。
 
-```typescript
-const closeHealth = startHealthServer({
-  checks: {
-    opa: async () => { /* OPA /health */ },
-  },
-}, logger);
-```
-
-#### 拡張方法 — Temporal 接続確認
-
-```typescript
-import { Connection } from '@temporalio/client';
-
-checks: {
-  opa: async () => {
-    const res = await fetch(`${config.opa.baseUrl}/health`, { signal: AbortSignal.timeout(2_000) });
-    return res.ok;
-  },
-
-  temporal: async () => {
-    // gRPC 接続確認 — connect が失敗すれば false を返す
-    try {
-      const conn = await Connection.connect({ address: config.temporal.address });
-      await conn.close();
-      return true;
-    } catch {
-      return false;
-    }
-  },
-},
-```
-
-#### 拡張方法 — PostgreSQL ping
+将来的な追加チェック例 — PostgreSQL ping:
 
 ```typescript
 import pg from 'pg';
 const pool = new pg.Pool({ connectionString: process.env.DATABASE_URL });
 
 checks: {
-  // ... 既存チェック ...
+  // ... 既存チェック (opa / redis / nats / temporal) ...
 
   postgres: async () => {
     try {
@@ -812,16 +786,6 @@ checks: {
     }
   },
 },
-```
-
-#### Readiness レスポンス例
-
-```json
-// 全チェック成功 → 200
-{ "status": "ok", "checks": { "opa": true, "temporal": true, "postgres": true } }
-
-// PostgreSQL 障害 → 503
-{ "status": "degraded", "checks": { "opa": true, "temporal": true, "postgres": false } }
 ```
 
 #### 注意事項
@@ -993,4 +957,364 @@ Invoke-RestMethod `
   -ContentType 'application/json' `
   -Body $body
 # 期待値: {"result":true}
+```
+
+---
+
+## 8. 通知アクティビティ実装 (v1.3 追加)
+
+> 改訂日: 2026-05-01 (v1.3 — 通知アクティビティ本実装 + DLQ コンシューマー追加)
+
+### 8.1 概要
+
+`sendNotificationActivity` をスタブから**本実装**に置き換えた。  
+2 つのバックエンドへ**ベストエフォート**で配信し、どちらが失敗してもワークフローを止めない。
+
+| # | バックエンド | 説明 |
+|---|---|---|
+| 1 | **NATS パブリッシュ** | `platform.notifications.{tenantId}` へ publish。フロントエンドや他サービスがリアルタイムに受信できる |
+| 2 | **HTTP Webhook** | `NOTIFICATION_WEBHOOK_URL` が設定されている場合に Slack / Teams / カスタムエンドポイントへ POST |
+
+### 8.2 NATS 通知の配信フロー
+
+```
+sendNotificationActivity(payload)
+  │
+  ├─ nc.publish('platform.notifications.{tenantId}', JSON.stringify(payload))
+  │    └─ サブスクライバー (フロントエンド WebSocket / 他サービス) がリアルタイム受信
+  │
+  └─ [webhookUrl が設定されている場合]
+       fetch(webhookUrl, { method: 'POST', body: JSON.stringify({...}) })
+```
+
+NATS 接続 (`notifNc`) は `index.ts` で作成し、DI チェーン経由で渡す:
+
+```
+index.ts
+  └─ const notifNc = await connect(...)
+       ↓
+  startWorker(config, logger, redis, notifNc)
+       ↓
+  createActivities(config, logger, redis, notifNc)
+       ↓
+  createSendNotificationActivity(config, logger, notifNc)
+```
+
+### 8.3 Webhook ペイロード仕様
+
+```json
+{
+  "service":   "orchestration-platform",
+  "requestId": "req-20260501-001",
+  "tenantId":  "tenant-a",
+  "userId":    "alice",
+  "status":    "allowed",
+  "message":   "File created: id=req-20260501-001, filename=report.pdf",
+  "timestamp": "2026-05-01T10:00:00.000Z"
+}
+```
+
+| フィールド | 型 | 説明 |
+|---|---|---|
+| `service` | string | 送信元サービス識別子 |
+| `requestId` | string | プラットフォームリクエスト ID |
+| `tenantId` | string | テナント ID |
+| `userId` | string | リクエスト発行ユーザー |
+| `status` | string | `"allowed"` / `"denied"` / `"quota-exceeded"` / `"error"` |
+| `message` | string | 人間可読な処理結果メッセージ |
+| `timestamp` | string | ISO 8601 形式の送信日時 |
+
+### 8.4 新規環境変数
+
+| 環境変数 | デフォルト | 説明 |
+|---|---|---|
+| `NOTIFICATION_NATS_SUBJECT` | `platform.notifications` | 通知 NATS サブジェクトプレフィックス |
+| `NOTIFICATION_WEBHOOK_URL` | `""` (空 = 無効) | Slack / Teams / カスタム Webhook URL |
+| `NOTIFICATION_WEBHOOK_TIMEOUT_MS` | `5000` | Webhook リクエストタイムアウト (ms) |
+
+### 8.5 OTel スパン — `notification.send`
+
+**トレーサー名:** `platform.notification`
+
+| 属性名 | 値 | 説明 |
+|---|---|---|
+| `platform.tenant_id` | `payload.tenantId` | テナント ID |
+| `platform.user_id` | `payload.userId` | ユーザー ID |
+| `platform.request_id` | `payload.requestId` | リクエスト ID |
+| `notification.status` | `payload.status` | 通知するステータス |
+| `notification.nats.subject` | サブジェクト文字列 | NATS publish 先 |
+| `notification.webhook.status_code` | HTTP ステータスコード | Webhook レスポンス (設定時のみ) |
+
+### 8.6 Prometheus メトリクス追加
+
+| メトリクス名 | 種別 | ラベル | 説明 |
+|---|---|---|---|
+| `platform_notifications_sent_total` | Counter | `status` | 正常 dispatch した通知数 |
+| `platform_notifications_failed_total` | Counter | `status` | dispatch に失敗した通知数 (非致命的) |
+
+---
+
+## 9. DLQ コンシューマー (v1.3 追加)
+
+### 9.1 概要
+
+Gateway が不正形式メッセージを `platform.dlq` へ転送していたが、従来は `nc.publish()` による**コアテキストのみの publish** だった。  
+今回、DLQ も **JetStream ストリーム (`PLATFORM-DLQ`) に永続化**し、専用の `startDlqConsumer()` プロセスで処理・モニタリングする構成に変更した。
+
+```
+Gateway (不正メッセージ検出)
+  │
+  └─ js.publish('platform.dlq', msg.data)   ← JetStream に永続化 (旧: nc.publish)
+          │
+          ▼
+  PLATFORM-DLQ ストリーム (7 日間保持)
+          │
+          ▼
+  dlqConsumer.ts (耐久コンシューマー: dlq-processor)
+    ├─ JSON パース試行 → 構造化 warn ログ
+    ├─ dlqProcessedTotal メトリクスインクリメント
+    ├─ Webhook アラート送信 (NOTIFICATION_WEBHOOK_URL が設定されている場合)
+    └─ ack / 失敗時は nak (JetStream が再配送)
+```
+
+### 9.2 DLQ JetStream ストリーム設定
+
+| 設定項目 | 値 | 説明 |
+|---|---|---|
+| ストリーム名 | `PLATFORM-DLQ` | 環境変数 `NATS_DLQ_STREAM_NAME` で変更可 |
+| サブジェクト | `platform.dlq` | 環境変数 `NATS_DLQ_SUBJECT` で変更可 |
+| 保持期間 | 7 日間 | 手動調査・再処理バッファ |
+| 最大メッセージ数 | 100,000 件 | |
+| 耐久コンシューマー | `dlq-processor` | — |
+
+### 9.3 DLQ コンシューマーの処理フロー
+
+```
+DLQ メッセージ受信 (seq = N)
+  │
+  ├─ JSON.parse 試行
+  │    ├─ 成功: 構造化フィールドをログに含める
+  │    └─ 失敗: { raw: rawText.slice(0, 512) } をログに含める
+  │
+  ├─ log.warn('DLQ message received', { seq, subject, timestamp, parseError?, payload })
+  │
+  ├─ dlqProcessedTotal.inc()
+  │
+  ├─ [NOTIFICATION_WEBHOOK_URL が設定されている場合]
+  │    fetch(webhookUrl, {
+  │      body: { type: 'dlq_alert', service, seq, subject, timestamp, parseError?, payload }
+  │    })
+  │    └─ dlqAlertSentTotal.inc({ result: 'success' | 'failure' | 'error' })
+  │
+  ├─ span.setStatus(OK)
+  ├─ msg.ack()
+  │
+  └─ [例外発生時]
+       span.recordException(err) → msg.nak() → JetStream 再配送
+```
+
+### 9.4 DLQ アラート Webhook ペイロード
+
+```json
+{
+  "type":       "dlq_alert",
+  "service":    "orchestration-platform",
+  "seq":        42,
+  "subject":    "platform.dlq",
+  "timestamp":  "2026-05-01T10:05:00.000Z",
+  "parseError": "Invalid JSON",
+  "payload":    { "raw": "malformed data..." }
+}
+```
+
+### 9.5 OTel スパン — `nats.dlq.process`
+
+**トレーサー名:** `platform.dlq`
+
+| 属性名 | 値 | 説明 |
+|---|---|---|
+| `messaging.system` | `"nats"` | メッセージングシステム識別 |
+| `messaging.destination` | `msg.subject` | DLQ サブジェクト |
+| `messaging.message.sequence` | `msg.seq` | JetStream シーケンス番号 |
+| `dlq.stream` | ストリーム名 | DLQ ストリーム名 |
+| `dlq.parse_error` | `"none"` / エラー文字列 | JSON パースエラー内容 |
+| `dlq.seq` | 数値 | シーケンス番号 |
+| `dlq.alert.status_code` | HTTP ステータスコード | Webhook 送信結果 (設定時のみ) |
+
+### 9.6 Prometheus メトリクス追加
+
+| メトリクス名 | 種別 | ラベル | 説明 |
+|---|---|---|---|
+| `platform_dlq_processed_total` | Counter | — | DLQ から取り出して処理したメッセージ数 |
+| `platform_dlq_alert_sent_total` | Counter | `result` (success/failure/error) | DLQ 警告 Webhook の送信結果数 |
+
+### 9.7 新規環境変数
+
+| 環境変数 | デフォルト | 説明 |
+|---|---|---|
+| `NATS_DLQ_STREAM_NAME` | `PLATFORM-DLQ` | DLQ JetStream ストリーム名 |
+
+### 9.8 Gateway の変更点
+
+旧実装では DLQ 転送に `nc.publish()` (コア NATS) を使用していたため、DLQ メッセージはメモリ内にしか存在しなかった。  
+新実装では `js.publish()` (JetStream) を使用し、ストリームに永続化するよう変更した。
+
+```typescript
+// 旧: コア NATS publish (非永続)
+nc.publish(config.nats.dlqSubject, msg.data);
+
+// 新: JetStream publish (永続化・再配送対応)
+await js.publish(config.nats.dlqSubject, msg.data);
+```
+
+また、メインストリーム (`PLATFORM`) 作成後に DLQ ストリーム (`PLATFORM-DLQ`) も冪等に作成するよう変更した。
+
+### 9.9 起動順序とプロセス構成
+
+```
+index.ts: Promise.all([
+  worker.run(),           // Temporal ワーカー
+  startGateway(...),      // NATS → Temporal ゲートウェイ
+  startDlqConsumer(...),  // DLQ モニタリングコンシューマー (新規追加)
+])
+```
+
+3 プロセスは並行実行される。いずれかが終了すると `AbortController` 経由で他にも shutdown シグナルが伝播する。
+
+DLQ Consumer は **独立した NATS 接続**を使用する (Gateway の接続とは別)。
+
+### 9.10 手動 DLQ 確認コマンド
+
+NATS CLI でストリームの状態を確認:
+
+```bash
+# ストリームの統計情報
+nats stream info PLATFORM-DLQ
+
+# 最新 DLQ メッセージを確認 (ack しない)
+nats consumer next PLATFORM-DLQ dlq-processor --count 5
+
+# DLQ メッセージを手動でパージ (調査完了後)
+nats stream purge PLATFORM-DLQ
+```
+
+---
+
+## 10. 品質改善 (v1.4)
+
+> 改訂日: 2026-05-01 (v1.4)
+
+### 10.1 ヘルスチェック充実 (②)
+
+**変更ファイル:** `src/product/index.ts`
+
+`startHealthServer` の `checks` に `redis` / `nats` / `temporal` の 3 チェックを追加した。
+
+| チェック | 実装 |
+|---|---|
+| `redis` | `redis.ping()` が `'PONG'` を返すことを確認 |
+| `nats` | `notifNc.isClosed() === false` を確認 (同期チェック) |
+| `temporal` | `Connection.connect()` → `workflowService.getSystemInfo()` が成功するか確認 |
+
+### 10.2 PK 重複を非リトライ化 (③)
+
+**変更ファイル:** `src/product/activities/persistenceActivity.ts`, `src/product/workflows/platformWorkflow.ts`
+
+#### 背景
+
+NATS JetStream の再配送などで同一 `requestId` が複数回到着すると、2 回目以降の `persistRequestActivity` で Prisma の `P2002` (Unique constraint violation) が発生していた。このエラーはリトライしても解消しないため、Temporal がリトライを繰り返して無駄なアクティビティ実行が発生していた。
+
+#### 対応
+
+1. `persistenceActivity.ts` に `DuplicateRequestError` クラスを追加し、`P2002` を検出した場合にスローする
+2. `platformWorkflow.ts` の `nonRetryableErrorTypes` に `'DuplicateRequestError'` を追加
+
+```typescript
+// persistenceActivity.ts
+export class DuplicateRequestError extends Error {
+  constructor(requestId: string) {
+    super(`Duplicate request ID: ${requestId}`);
+    this.name = 'DuplicateRequestError';
+  }
+}
+
+// P2002 検出
+if (err?.code === 'P2002') {
+  throw new DuplicateRequestError(request.requestId);
+}
+```
+
+```typescript
+// platformWorkflow.ts
+nonRetryableErrorTypes: ['PolicyViolation', 'DuplicateRequestError'],
+```
+
+### 10.3 設定バリデーション (④)
+
+**変更ファイル:** `src/product/config.ts`
+
+`loadConfig()` 末尾で `validateConfig(cfg)` を呼び出し、不正な設定を**起動前にフェイルファスト**で検出するようにした。
+
+検査内容は「4.1 config.ts」セクションの表を参照。
+
+### 10.4 補償リトライポリシー分離 (⑥)
+
+**変更ファイル:** `src/product/workflows/platformWorkflow.ts`
+
+`compensateRequestActivity` を独立した `proxyActivities` ブロックで宣言し、通常アクティビティとは異なるリトライポリシーを適用した。
+
+#### 設計根拠
+
+補償 (Saga ロールバック) は以下の理由から通常アクティビティより長いタイムアウトと多いリトライを設定する:
+
+- 補償失敗はデータ不整合に直結するため、できる限りリトライすべき
+- 補償対象の外部 API (FileStorageService / UserService) は冪等なので積極リトライが安全
+- 補償処理はメインフローより優先度が低くてよいため、より長い待機時間を許容できる
+
+| 設定 | 通常 | 補償 |
+|---|---|---|
+| `startToCloseTimeout` | 30 秒 | **60 秒** |
+| `maximumAttempts` | 3 | **5** |
+| `nonRetryableErrorTypes` | `['PolicyViolation', 'DuplicateRequestError']` | `[]` (全エラーでリトライ) |
+
+### 10.5 node-fetch 除去 (⑨)
+
+**変更ファイル:** `src/product/activities/opaActivity.ts`, `src/product/policies/loadPolicy.ts`, `src/product/index.ts`
+
+Node.js 18+ のグローバル `fetch` が利用可能になったため、`node-fetch` パッケージへの依存を除去した。
+
+主な変更点:
+- `import fetch from 'node-fetch'` を削除
+- `signal` 型キャストの複雑な `unknown as ...` 式が不要になった (`controller.signal` をそのまま渡せる)
+- テストの `vi.mock('node-fetch', ...)` を `vi.stubGlobal('fetch', ...)` に変更
+
+### 10.6 PrismaClient DI (⑩)
+
+**変更ファイル:** `src/product/activities/persistenceActivity.ts`, `src/product/activities/index.ts`
+
+#### 背景
+
+`persistenceActivity.ts` でモジュールレベルに `const prisma = new PrismaClient()` があったため、ユニットテスト時にモジュールモック (`vi.mock`) が必要だった。
+
+#### 対応
+
+- `createPersistRequestActivity(config, logger, prisma)` の第 3 引数として `PrismaClient` インスタンスを受け取るよう変更
+- `createActivities()` 内で `new PrismaClient()` を 1 回だけ生成して渡す
+- テスト側は `vi.mock` が不要になり、`mockPrisma` オブジェクトを直接引数に渡せるようになった
+
+```typescript
+// activities/index.ts (変更後)
+export function createActivities(config, logger, redis, nc) {
+  const prisma = new PrismaClient();        // ← ここで 1 回生成
+  return {
+    persistRequestActivity: createPersistRequestActivity(config, logger, prisma),
+    // ...
+  };
+}
+```
+
+```typescript
+// テスト (変更後) — vi.mock 不要
+const mockPrisma = { platformRequest: { upsert: mockUpsert } };
+persistRequestActivity = mod.createPersistRequestActivity(mockConfig, mockLogger, mockPrisma);
 ```
