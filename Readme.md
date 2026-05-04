@@ -189,8 +189,15 @@ src/product/
 ├── activities/
 │   ├── index.ts               アクティビティレジストリ + PlatformActivities 型
 │   ├── opaActivity.ts         OPA ポリシー評価 (タイムアウト + リトライ)
+│   ├── orchestrationActivity.ts 定義駆動オーケストレーション実行
 │   ├── notificationActivity.ts 通知送信 (Webhook/Email 差し替え可)
 │   └── persistenceActivity.ts DB 永続化 (PostgreSQL upsert 雛形付き)
+├── orchestrations/
+│   ├── catalog.ts              orchestrationId → 定義の対応表
+│   ├── fileUploadAndMail.ts    ファイル保管後にメール送信する例
+│   ├── relationSyncFlow.ts     複数サービス連携の例
+│   ├── userCreateFlow.ts       User → FileStorage の例
+│   └── index.ts                定義群の export 集約
 └── policies/
     ├── platform.rego           テナント RBAC Rego ポリシー
     ├── platform-data.json      RBAC データ (ユーザー/ロール/テナント)
@@ -209,6 +216,7 @@ src/product/
 | **構造化ログ** | JSON形式、子ロガーで相関ID伝播 |
 | **DLQ** | 不正形式メッセージは `platform.dlq` へ転送して ack |
 | **Signal/Query** | `cancel` シグナル・`getStatus` クエリ対応 |
+| **定義駆動オーケストレーション** | `payload.orchestrationId` で `src/product/orchestrations/` の定義を選択し、`orchestrationActivity.ts` が順次実行 |
 
 ### 起動手順
 
@@ -227,9 +235,21 @@ NATS へのテストメッセージ送信例:
 {
   "requestId": "req-001", "tenantId": "tenant-a",
   "userId": "alice", "action": "create", "resource": "orders",
-  "payload": {}
+   "payload": {
+      "orchestrationId": "file-upload-and-mail"
+   }
 }
 ```
 を subject `platform.events.orders` へ publish すると、OPA → Temporal ワークフローが自動的に動作します。
+
+### オーケストレーション定義の使い方
+
+`src/product/orchestrations/catalog.ts` に登録された `orchestrationId` を `PlatformRequest.payload.orchestrationId` に入れると、ワークフローが該当する定義を選んで実行します。現在の例は次の 3 つです。
+
+- `file-upload-and-mail`
+- `user-create-flow`
+- `relation-sync-flow`
+
+新しい連携を追加する場合は、`src/product/orchestrations/` に定義ファイルを追加して、`catalog.ts` に ID を登録します。実行エンジンは `src/product/activities/orchestrationActivity.ts` を共通利用します。
 
 変更を行いました。
