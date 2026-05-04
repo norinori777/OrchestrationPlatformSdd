@@ -55,3 +55,68 @@ export interface QuotaResult {
   /** 設定されたクォータ上限 */
   limit: number;
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 定義駆動オーケストレーション — 複数マイクロサービス連携用の型定義
+// PlatformRequest.payload.orchestration に OrchestrationDefinition を埋め込むと
+// platformWorkflow が steps を順番に実行し、失敗時は逆順に補償する。
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** orchestration step 内の補償 (Saga 巻き戻し) 定義 */
+export interface StepCompensation {
+  /** 補償呼び出し先サービス名 */
+  service: string;
+  method:  'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE';
+  /** パスは "{result.id}" 等のテンプレートで step の実行結果を参照できる */
+  path:    string;
+  headers?: Record<string, string>;
+  query?:   Record<string, string>;
+  body?:    Record<string, unknown>;
+}
+
+/** orchestration の 1 ステップ定義 */
+export interface OrchestrationStep {
+  /** 呼び出し先サービス名 (SERVICE_REGISTRY のキー) */
+  service: string;
+  method:  'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE';
+  /**
+   * 呼び出し先パス。
+   * "{step0.body.id}" のように前段ステップの実行結果を参照できる。
+   * "{requestId}", "{tenantId}", "{userId}" もコンテキストから参照可能。
+   */
+  path:     string;
+  headers?: Record<string, string>;
+  query?:   Record<string, string>;
+  body?:    Record<string, unknown>;
+  /** 失敗時の巻き戻し定義 (省略可) */
+  compensation?: StepCompensation;
+}
+
+/**
+ * 定義駆動オーケストレーション定義。
+ * PlatformRequest.payload.orchestration に埋め込む。
+ *
+ * @example
+ * payload: {
+ *   orchestration: {
+ *     steps: [
+ *       { service: "user-service",  method: "POST", path: "/api/users",
+ *         body: { email: "u@example.com", name: "Taro" },
+ *         compensation: { service: "user-service", method: "DELETE", path: "/api/users/{result.id}" } },
+ *       { service: "file-storage-service", method: "POST", path: "/api/files",
+ *         body: { userId: "{step0.body.id}", storagePath: "/data/sample.txt" } }
+ *     ]
+ *   }
+ * }
+ */
+export interface OrchestrationDefinition {
+  steps: OrchestrationStep[];
+}
+
+/** executeOrchestrationActivity が管理する 1 ステップ分の実行結果 */
+export interface StepResult {
+  stepIndex: number;
+  service:   string;
+  status:    number;
+  body:      unknown;
+}

@@ -14,6 +14,7 @@ import { createEvaluatePolicyActivity }   from './opaActivity.ts';
 import { createSendNotificationActivity } from './notificationActivity.ts';
 import { createPersistRequestActivity }   from './persistenceActivity.ts';
 import { createCheckQuotaActivity }       from './quotaActivity.ts';
+import { executeOrchestrationActivity }   from './orchestrationActivity.ts';
 // @ts-ignore — カスタム出力パスから生成された Prisma Client
 import { PrismaClient } from '../../../node_modules/.prisma/product-client/index.js';
 
@@ -202,12 +203,13 @@ async function compensateRequestActivity(request: PlatformRequest): Promise<stri
 export function createActivities(config: Config, logger: Logger, redis: Redis, nc: NatsConnection) {
   const prisma = new PrismaClient();
   return {
-    evaluatePolicyActivity:   createEvaluatePolicyActivity(config, logger),
-    sendNotificationActivity: createSendNotificationActivity(config, logger, nc),
-    persistRequestActivity:   createPersistRequestActivity(config, logger, prisma),
-    checkQuotaActivity:       createCheckQuotaActivity(config, logger, redis),
+    evaluatePolicyActivity:      createEvaluatePolicyActivity(config, logger),
+    sendNotificationActivity:    createSendNotificationActivity(config, logger, nc),
+    persistRequestActivity:      createPersistRequestActivity(config, logger, prisma),
+    checkQuotaActivity:          createCheckQuotaActivity(config, logger, redis),
     compensateRequestActivity,
     processRequestActivity,
+    executeOrchestrationActivity,
   };
 }
 
@@ -215,6 +217,7 @@ export function createActivities(config: Config, logger: Logger, redis: Redis, n
 export type PlatformActivities = {
   evaluatePolicyActivity(input: PolicyInput): Promise<boolean>;
   processRequestActivity(request: PlatformRequest): Promise<string>;
+  executeOrchestrationActivity(request: PlatformRequest): Promise<string>;
   compensateRequestActivity(request: PlatformRequest): Promise<string>;
   sendNotificationActivity(payload: NotificationPayload): Promise<void>;
   persistRequestActivity(request: PlatformRequest, status: RequestStatus, result?: string): Promise<void>;

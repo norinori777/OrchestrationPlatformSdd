@@ -24,11 +24,13 @@ import {
 } from '@temporalio/workflow';
 import type { PlatformRequest, PlatformResponse, PolicyInput, NotificationPayload, QuotaResult } from '../types.ts';
 import type { PlatformActivities } from '../activities/index.ts';
+import { resolveOrchestrationDefinition } from '../orchestrations/catalog.ts';
 
 // アクティビティプロキシ — タイムアウト・リトライポリシーを設定
 const {
   evaluatePolicyActivity,
   processRequestActivity,
+  executeOrchestrationActivity,
   sendNotificationActivity,
   persistRequestActivity,
   checkQuotaActivity,
@@ -161,8 +163,33 @@ export async function platformWorkflow(request: PlatformRequest): Promise<Platfo
     return response(request.requestId, 'error', 'Cancelled during processing');
   }
 
+  // orchestration 定義がある場合は定義駆動で複数ステップを実行する
+  const orchestrationId = typeof request.payload.orchestrationId === 'string'
+    ? request.payload.orchestrationId
+    : undefined;
+  const catalogOrchestration = orchestrationId
+    ? resolveOrchestrationDefinition(orchestrationId)
+    : undefined;
+  const embeddedOrchestration = request.payload.orchestration;
+  const orchestration = embeddedOrchestration ?? catalogOrchestration;
+  const hasOrchestration =
+    Array.isArray((orchestration as { steps?: unknown[] } | undefined)?.steps) &&
+    ((orchestration as { steps?: unknown[] } | undefined)?.steps?.length ?? 0) > 0;
+
+  const orchestrationRequest = orchestration
+    ? {
+        ...request,
+        payload: {
+          ...request.payload,
+          orchestration,
+        },
+      }
+    : request;
+
   try {
-    const result = await processRequestActivity(request);
+    const result = hasOrchestration
+      ? await executeOrchestrationActivity(orchestrationRequest)
+      : await processRequestActivity(request);
 
     // アクティビティ実行中にキャンセルシグナルが届いた場合
     if (cancelled) {
@@ -193,7 +220,8 @@ export async function platformWorkflow(request: PlatformRequest): Promise<Platfo
       err: errorMessage,
     });
 
-    if (request.action === 'create') {
+    // orchestration モードは activity 内部で補償済— 単発モードのみ外側の補償を呼ぶ
+    if (request.action === 'create' && !hasOrchestration) {
       currentStatus = 'compensating';
       const compensationResult = await compensateRequestActivity(request);
       log.warn('Saga compensation executed', {
