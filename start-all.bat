@@ -32,6 +32,9 @@ start "User Service" cmd /k "cd /d ""%ROOT%\src\MicroService\UserService"" && np
 echo Starting file storage microservice...
 start "File Storage Service" cmd /k "cd /d ""%ROOT%\src\MicroService\FileStorageService"" && npm run dev"
 
+echo Starting routing file microservice...
+start "Routing File Service" cmd /k "cd /d ""%ROOT%\src\MicroService\RoutingFile"" && npm run dev"
+
 echo.
 echo All components were launched in separate windows.
 echo Close each window when you want to stop the corresponding process.
@@ -48,6 +51,7 @@ echo start "SaaS Backend" cmd /k "cd /d ""%ROOT%\src\Saas\backend"" ^&^& npm run
 echo start "SaaS Frontend" cmd /k "cd /d ""%ROOT%\src\Saas\frontend"" ^&^& npm run dev"
 echo start "User Service" cmd /k "cd /d ""%ROOT%\src\MicroService\UserService"" ^&^& npm run dev"
 echo start "File Storage Service" cmd /k "cd /d ""%ROOT%\src\MicroService\FileStorageService"" ^&^& npm run dev"
+echo start "Routing File Service" cmd /k "cd /d ""%ROOT%\src\MicroService\RoutingFile"" ^&^& npm run dev"
 popd
 exit /b 0
 
