@@ -1,15 +1,18 @@
 import type { OrchestrationDefinition } from '../types.ts';
 import { fileUploadAndMail } from './fileUploadAndMail.ts';
+import { fileUploadAndRouting } from './fileUploadAndRouting.ts';
 import { userCreateFlow } from './userCreateFlow.ts';
 import { relationSyncFlow } from './relationSyncFlow.ts';
 
 export type OrchestrationId =
   | 'file-upload-and-mail'
+  | 'file-upload-and-routing'
   | 'user-create-flow'
   | 'relation-sync-flow';
 
 export const ORCHESTRATION_CATALOG: Record<OrchestrationId, OrchestrationDefinition> = {
   'file-upload-and-mail': fileUploadAndMail,
+  'file-upload-and-routing': fileUploadAndRouting,
   'user-create-flow':     userCreateFlow,
   'relation-sync-flow':   relationSyncFlow,
 };

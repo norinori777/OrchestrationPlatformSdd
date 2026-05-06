@@ -1,4 +1,5 @@
 export { fileUploadAndMail } from './fileUploadAndMail.ts';
+export { fileUploadAndRouting } from './fileUploadAndRouting.ts';
 export { userCreateFlow } from './userCreateFlow.ts';
 export { relationSyncFlow } from './relationSyncFlow.ts';
 export {
