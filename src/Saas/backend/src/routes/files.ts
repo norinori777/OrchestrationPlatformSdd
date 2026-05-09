@@ -1,25 +1,41 @@
 import { Router, Request, Response } from 'express';
 import { v4 as uuidv4 } from 'uuid';
+import * as path from 'path';
 import * as yup from 'yup';
 import { publishEvent } from '../natsClient';
 import { prisma } from '../db';
 
 const router = Router();
+const FILE_UPLOAD_ORCHESTRATION_ID = 'file-upload-and-routing';
 
 const createFileSchema = yup.object({
   tenantId:    yup.string().required(),
   userId:      yup.string().required(),
   filename:    yup.string().required(),
-  storagePath: yup.string().required(),
+  fileContentBase64: yup.string().required(),
   size:        yup.number().optional(),
   contentType: yup.string().optional(),
+  orchestrationId: yup.string().optional(),
 });
+
+const DEFAULT_ORCHESTRATION_ID = 'file-upload-and-routing';
 
 // POST /api/files — ファイル保管イベントを発行
 router.post('/', async (req: Request, res: Response): Promise<void> => {
   try {
     const body = await createFileSchema.validate(req.body, { abortEarly: false });
     const requestId = `req-file-${uuidv4()}`;
+    const safeFilename = path.basename(body.filename);
+    const storagePath = `uploads/${requestId}/${safeFilename}`;
+    const contentType = body.contentType ?? 'application/octet-stream';
+    const orchestrationId = body.orchestrationId ?? DEFAULT_ORCHESTRATION_ID;
+    const payload = {
+      ...body,
+      filename: safeFilename,
+      storagePath,
+      contentType,
+      orchestrationId,
+    };
 
     await prisma.saasRequest.create({
       data: {
@@ -29,7 +45,7 @@ router.post('/', async (req: Request, res: Response): Promise<void> => {
         action:   'create',
         resource: 'files',
         status:   'pending',
-        payload:  body,
+        payload,
       },
     });
 
@@ -39,12 +55,7 @@ router.post('/', async (req: Request, res: Response): Promise<void> => {
       userId:    body.userId,
       action:    'create',
       resource:  'files',
-      payload: {
-        filename:    body.filename,
-        storagePath: body.storagePath,
-        size:        body.size,
-        contentType: body.contentType,
-      },
+      payload,
     });
 
     res.status(202).json({ requestId, status: 'pending' });
@@ -68,7 +79,19 @@ router.get('/:requestId', async (req: Request, res: Response): Promise<void> => 
       res.status(404).json({ error: 'Request not found' });
       return;
     }
-    res.json(record);
+    const parsedResult = (() => {
+      if (!record.result) return null;
+      try {
+        return JSON.parse(record.result);
+      } catch {
+        return null;
+      }
+    })();
+
+    res.json({
+      ...record,
+      parsedResult,
+    });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Internal server error' });

@@ -1,6 +1,9 @@
 import { Router, Request, Response } from 'express';
+import * as fs from 'fs';
+import * as path from 'path';
 import * as yup from 'yup';
 import { prisma } from '../db';
+import { STORAGE_ROOT } from '../config';
 
 const router = Router();
 
@@ -12,12 +15,31 @@ const createSchema = yup.object({
   storagePath: yup.string().required(),
   size:        yup.number().nullable().optional(),
   contentType: yup.string().nullable().optional(),
+  fileContentBase64: yup.string().required(),
 });
+
+function resolveStoragePath(relativeStoragePath: string): string {
+  const normalized = relativeStoragePath.replace(/^[/\\]+/, '');
+  const resolved = path.resolve(STORAGE_ROOT, normalized);
+  const rootWithSeparator = `${STORAGE_ROOT}${path.sep}`;
+
+  if (resolved !== STORAGE_ROOT && !resolved.startsWith(rootWithSeparator)) {
+    throw new Error(`Invalid storage path: ${relativeStoragePath}`);
+  }
+
+  return resolved;
+}
 
 // POST /api/files
 router.post('/', async (req: Request, res: Response): Promise<void> => {
   try {
     const body = await createSchema.validate(req.body, { abortEarly: false });
+    const storagePath = resolveStoragePath(body.storagePath);
+    const fileBuffer = Buffer.from(body.fileContentBase64, 'base64');
+
+    fs.mkdirSync(path.dirname(storagePath), { recursive: true });
+    fs.writeFileSync(storagePath, fileBuffer);
+
     // upsert で冪等性を確保 (Temporal リトライ時に同一 id が再送されても安全)
     const file = await prisma.file.upsert({
       where: { id: body.id },
@@ -26,7 +48,7 @@ router.post('/', async (req: Request, res: Response): Promise<void> => {
         tenantId:    body.tenantId,
         userId:      body.userId,
         filename:    body.filename,
-        storagePath: body.storagePath,
+        storagePath,
         size:        body.size ?? null,
         contentType: body.contentType ?? null,
       },

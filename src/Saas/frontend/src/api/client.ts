@@ -6,13 +6,25 @@ export interface RequestResult {
   result?: string
 }
 
+export interface FileRequestRecord extends RequestResult {
+  tenantId?: string
+  userId?: string
+  action?: string
+  resource?: string
+  payload?: unknown
+  parsedResult?: unknown
+  createdAt?: string
+  updatedAt?: string
+}
+
 export async function uploadFile(data: {
   tenantId: string
   userId: string
   filename: string
-  storagePath: string
+  fileContentBase64: string
   size?: number
   contentType?: string
+  orchestrationId?: string
 }): Promise<RequestResult> {
   const res = await fetch(`${BASE}/files`, {
     method: 'POST',
@@ -36,6 +48,15 @@ export async function deleteFile(
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ tenantId, userId }),
   })
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ error: res.statusText }))
+    throw new Error(JSON.stringify(err))
+  }
+  return res.json()
+}
+
+export async function getFileRequest(requestId: string): Promise<FileRequestRecord> {
+  const res = await fetch(`${BASE}/files/${encodeURIComponent(requestId)}`)
   if (!res.ok) {
     const err = await res.json().catch(() => ({ error: res.statusText }))
     throw new Error(JSON.stringify(err))

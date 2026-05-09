@@ -21,11 +21,23 @@ export function validateExtension(filePath: string): void {
   }
 }
 
-export function readFileContent(filePath: string): string {
+export function readFileContent(filePath: string, fallbackContent?: string): string {
+  const ext = path.extname(filePath).toLowerCase();
+  if (!SUPPORTED_EXTENSIONS.has(ext)) {
+    if (fallbackContent !== undefined) {
+      return fallbackContent;
+    }
+    throw new Error(
+      `Unsupported file type: ${ext}. Supported: ${[...SUPPORTED_EXTENSIONS].join(', ')}`
+    );
+  }
+
   if (!fs.existsSync(filePath)) {
+    if (fallbackContent !== undefined) {
+      return fallbackContent;
+    }
     throw new Error(`File not found: ${filePath}`);
   }
-  validateExtension(filePath);
   return fs.readFileSync(filePath, 'utf-8');
 }
 
@@ -51,7 +63,7 @@ export function splitIntoChunks(content: string): FileChunk[] {
   return chunks;
 }
 
-export function readAndChunk(filePath: string): FileChunk[] {
-  const content = readFileContent(filePath);
+export function readAndChunk(filePath: string, fallbackContent?: string): FileChunk[] {
+  const content = readFileContent(filePath, fallbackContent);
   return splitIntoChunks(content);
 }

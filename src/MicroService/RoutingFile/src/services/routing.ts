@@ -1,3 +1,4 @@
+import * as path from 'path';
 import { v4 as uuidv4 } from 'uuid';
 import { prisma } from '../db';
 import { readAndChunk } from './fileReader';
@@ -23,7 +24,13 @@ export async function classifyFile(req: ClassifyRequest): Promise<ClassifyRespon
 
   try {
     // ファイル読み込み & チャンク分割
-    const chunks = readAndChunk(req.filePath);
+    const fallbackContent = [
+      `Original file name: ${req.originalName}`,
+      `Stored path: ${req.filePath}`,
+      `Mime type: ${req.mimeType}`,
+      `Path name: ${path.basename(req.filePath)}`,
+    ].join('\n');
+    const chunks = readAndChunk(req.filePath, fallbackContent);
     const limitedChunks = chunks.slice(0, MAX_CHUNKS);
 
     // 各チャンクを分類

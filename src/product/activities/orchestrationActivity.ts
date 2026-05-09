@@ -85,6 +85,7 @@ function buildContext(request: PlatformRequest, results: StepResult[]): Record<s
     requestId: request.requestId,
     tenantId:  request.tenantId,
     userId:    request.userId,
+    payload:   request.payload,
   };
   for (let i = 0; i < results.length; i++) {
     const r = results[i];
@@ -235,9 +236,12 @@ export async function executeOrchestrationActivity(request: PlatformRequest): Pr
     }
   }
 
-  const summary = stepResults
-    .map(r => `step${r.stepIndex}(${r.service}):HTTP${r.status}`)
-    .join(', ');
+  const routingResult = stepResults[stepResults.length - 1]?.body ?? null;
 
-  return `Orchestration completed [${steps.length} steps] — ${summary}`;
+  return JSON.stringify({
+    orchestrationSteps: steps.length,
+    summary: `Orchestration completed [${steps.length} steps]`,
+    stepResults,
+    routingResult,
+  });
 }
