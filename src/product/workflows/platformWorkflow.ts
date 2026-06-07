@@ -22,9 +22,8 @@ import {
   setHandler,
   log,
 } from '@temporalio/workflow';
-import type { PlatformRequest, PlatformResponse, PolicyInput, NotificationPayload, QuotaResult } from '../types.ts';
+import type { PlatformRequest, PlatformResponse, PolicyInput, NotificationPayload, QuotaResult, OrchestrationDefinition } from '../types.ts';
 import type { PlatformActivities } from '../activities/index.ts';
-import { resolveOrchestrationDefinition } from '../orchestrations/catalog.ts';
 
 // アクティビティプロキシ — タイムアウト・リトライポリシーを設定
 const {
@@ -34,6 +33,7 @@ const {
   sendNotificationActivity,
   persistRequestActivity,
   checkQuotaActivity,
+  resolveOrchestrationDefinitionActivity,
 } = proxyActivities<PlatformActivities>({
   startToCloseTimeout: '30 seconds',
   retry: {
@@ -167,11 +167,12 @@ export async function platformWorkflow(request: PlatformRequest): Promise<Platfo
   const orchestrationId = typeof request.payload.orchestrationId === 'string'
     ? request.payload.orchestrationId
     : undefined;
-  const catalogOrchestration = orchestrationId
-    ? resolveOrchestrationDefinition(orchestrationId)
+  const embeddedOrchestration = isOrchestrationDefinition(request.payload.orchestration)
+    ? request.payload.orchestration
     : undefined;
-  const embeddedOrchestration = request.payload.orchestration;
-  const orchestration = embeddedOrchestration ?? catalogOrchestration;
+  const orchestration: OrchestrationDefinition | undefined = embeddedOrchestration ?? (
+    orchestrationId ? await resolveOrchestrationDefinitionActivity(orchestrationId) : undefined
+  );
   const hasOrchestration =
     Array.isArray((orchestration as { steps?: unknown[] } | undefined)?.steps) &&
     ((orchestration as { steps?: unknown[] } | undefined)?.steps?.length ?? 0) > 0;
@@ -233,6 +234,14 @@ export async function platformWorkflow(request: PlatformRequest): Promise<Platfo
     await persistRequestActivity(request, 'failed', `Rolled back after failure: ${errorMessage}`);
     return response(request.requestId, 'error', `Workflow failed: ${errorMessage}`);
   }
+}
+
+function isOrchestrationDefinition(value: unknown): value is OrchestrationDefinition {
+  if (value == null || typeof value !== 'object' || Array.isArray(value)) {
+    return false;
+  }
+
+  return Array.isArray((value as { steps?: unknown }).steps);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

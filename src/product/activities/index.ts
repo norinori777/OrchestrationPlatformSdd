@@ -5,7 +5,7 @@
 // ─────────────────────────────────────────────────────────────────────────────
 import type { Config } from '../config.ts';
 import type { Logger } from '../logger.ts';
-import type { PlatformRequest, PolicyInput, NotificationPayload, RequestStatus, QuotaResult } from '../types.ts';
+import type { PlatformRequest, PolicyInput, NotificationPayload, RequestStatus, QuotaResult, OrchestrationDefinition } from '../types.ts';
 import type Redis from 'ioredis';
 import type { NatsConnection } from 'nats';
 import { SpanStatusCode }                        from '@opentelemetry/api';
@@ -14,7 +14,7 @@ import { createEvaluatePolicyActivity }   from './opaActivity.ts';
 import { createSendNotificationActivity } from './notificationActivity.ts';
 import { createPersistRequestActivity }   from './persistenceActivity.ts';
 import { createCheckQuotaActivity }       from './quotaActivity.ts';
-import { executeOrchestrationActivity }   from './orchestrationActivity.ts';
+import { executeOrchestrationActivity, resolveOrchestrationDefinitionActivity }   from './orchestrationActivity.ts';
 // @ts-ignore — カスタム出力パスから生成された Prisma Client
 import { PrismaClient } from '../../../node_modules/.prisma/product-client/index.js';
 
@@ -210,6 +210,7 @@ export function createActivities(config: Config, logger: Logger, redis: Redis, n
     compensateRequestActivity,
     processRequestActivity,
     executeOrchestrationActivity,
+    resolveOrchestrationDefinitionActivity,
   };
 }
 
@@ -218,6 +219,7 @@ export type PlatformActivities = {
   evaluatePolicyActivity(input: PolicyInput): Promise<boolean>;
   processRequestActivity(request: PlatformRequest): Promise<string>;
   executeOrchestrationActivity(request: PlatformRequest): Promise<string>;
+  resolveOrchestrationDefinitionActivity(orchestrationId: string): Promise<OrchestrationDefinition>;
   compensateRequestActivity(request: PlatformRequest): Promise<string>;
   sendNotificationActivity(payload: NotificationPayload): Promise<void>;
   persistRequestActivity(request: PlatformRequest, status: RequestStatus, result?: string): Promise<void>;

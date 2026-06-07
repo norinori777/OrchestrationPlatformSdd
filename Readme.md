@@ -216,7 +216,7 @@ src/product/
 | **構造化ログ** | JSON形式、子ロガーで相関ID伝播 |
 | **DLQ** | 不正形式メッセージは `platform.dlq` へ転送して ack |
 | **Signal/Query** | `cancel` シグナル・`getStatus` クエリ対応 |
-| **定義駆動オーケストレーション** | `payload.orchestrationId` で `src/product/orchestrations/` の定義を選択し、`orchestrationActivity.ts` が順次実行 |
+| **定義駆動オーケストレーション** | `payload.orchestrationId` は built-in catalog または `ORCHESTRATION_CATALOG_PATH` で解決し、`payload.orchestration` を直接埋め込むこともできる |
 
 ### 起動手順
 
@@ -244,12 +244,12 @@ NATS へのテストメッセージ送信例:
 
 ### オーケストレーション定義の使い方
 
-`src/product/orchestrations/catalog.ts` に登録された `orchestrationId` を `PlatformRequest.payload.orchestrationId` に入れると、ワークフローが該当する定義を選んで実行します。現在の例は次の 3 つです。
+`PlatformRequest.payload.orchestrationId` を入れると、ワークフローが該当する定義を選んで実行します。標準の定義は built-in catalog にありますが、`ORCHESTRATION_CATALOG_PATH` を指定すると deployment ごとに外部 manifest を重ねられます。`payload.orchestration` に直接定義を埋め込めば、プラットフォーム側の catalog 編集なしで実行できます。
 
 - `file-upload-and-mail`
 - `user-create-flow`
 - `relation-sync-flow`
 
-新しい連携を追加する場合は、`src/product/orchestrations/` に定義ファイルを追加して、`catalog.ts` に ID を登録します。実行エンジンは `src/product/activities/orchestrationActivity.ts` を共通利用します。
+新しい連携を追加する場合は、deployment 固有の manifest に定義を追加してください。サービス接続先は `SERVICE_REGISTRY_PATH` で上書きでき、マイクロサービスの追加・変更・削除をコード修正なしで吸収しやすくなります。実行エンジンは `src/product/activities/orchestrationActivity.ts` を共通利用します。
 
 変更を行いました。

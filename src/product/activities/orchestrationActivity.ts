@@ -14,10 +14,13 @@
 //   ・{userId}         — ユーザー ID
 //   補償定義では {result.xxx} で「そのステップ自身の実行結果」を参照できる。
 //
-// ■ サービスの追加
-//   SERVICE_REGISTRY にエントリを追加するだけで新しいサービスに対応できる。
+// ■ カスタマイズ
+//   ・SERVICE_REGISTRY_PATH でサービス URL の manifest を差し替えられる。
+//   ・ORCHESTRATION_CATALOG_PATH で orchestration 定義の manifest を追加できる。
 // ─────────────────────────────────────────────────────────────────────────────
 import { SpanStatusCode } from '@opentelemetry/api';
+import { readFile }       from 'node:fs/promises';
+import { resolve as resolvePath } from 'node:path';
 import { getTracer }      from '../telemetry.ts';
 import type {
   PlatformRequest,
@@ -25,27 +28,104 @@ import type {
   OrchestrationStep,
   StepResult,
 } from '../types.ts';
+import { ORCHESTRATION_CATALOG } from '../orchestrations/catalog.ts';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // サービスレジストリ — サービス名 → ベース URL
-// 新しいマイクロサービスを追加する場合はここにエントリを追加する
+// デフォルトは環境変数、必要に応じて JSON manifest で拡張できる
 // ─────────────────────────────────────────────────────────────────────────────
-export const SERVICE_REGISTRY: Record<string, string> = {
+type ServiceRegistry = Record<string, string>;
+
+type OrchestrationCatalog = Record<string, OrchestrationDefinition>;
+
+const DEFAULT_SERVICE_REGISTRY: ServiceRegistry = {
   'user-service':         process.env.USER_SERVICE_URL          ?? 'http://localhost:4002',
   'file-storage-service': process.env.FILE_STORAGE_SERVICE_URL  ?? 'http://localhost:4001',
   'mail-service':         process.env.MAIL_SERVICE_URL          ?? 'http://localhost:4004',
   'routing-file-service': process.env.ROUTING_FILE_SERVICE_URL  ?? 'http://localhost:4003',
 };
 
-function resolveServiceUrl(service: string): string {
-  const url = SERVICE_REGISTRY[service];
+let serviceRegistryCache: ServiceRegistry | undefined;
+let orchestrationCatalogCache: OrchestrationCatalog | undefined;
+
+function normalizeCatalog(raw: unknown): OrchestrationCatalog {
+  if (raw == null || typeof raw !== 'object' || Array.isArray(raw)) {
+    throw new Error('Orchestration catalog manifest must be a JSON object keyed by orchestrationId');
+  }
+
+  const catalog: OrchestrationCatalog = {};
+  for (const [id, definition] of Object.entries(raw)) {
+    if (!definition || typeof definition !== 'object' || !Array.isArray((definition as { steps?: unknown }).steps)) {
+      throw new Error(`Invalid orchestration definition for "${id}" in manifest`);
+    }
+    catalog[id] = definition as OrchestrationDefinition;
+  }
+
+  return catalog;
+}
+
+async function loadJsonManifest<T>(manifestPath: string): Promise<T> {
+  const absolutePath = resolvePath(process.cwd(), manifestPath);
+  const content = await readFile(absolutePath, 'utf8');
+  return JSON.parse(content) as T;
+}
+
+async function loadServiceRegistry(): Promise<ServiceRegistry> {
+  if (serviceRegistryCache) {
+    return serviceRegistryCache;
+  }
+
+  const manifestPath = process.env.SERVICE_REGISTRY_PATH;
+  if (!manifestPath) {
+    serviceRegistryCache = DEFAULT_SERVICE_REGISTRY;
+    return serviceRegistryCache;
+  }
+
+  const manifest = await loadJsonManifest<Record<string, string>>(manifestPath);
+  serviceRegistryCache = { ...DEFAULT_SERVICE_REGISTRY, ...manifest };
+  return serviceRegistryCache;
+}
+
+async function loadOrchestrationCatalog(): Promise<OrchestrationCatalog> {
+  if (orchestrationCatalogCache) {
+    return orchestrationCatalogCache;
+  }
+
+  const manifestPath = process.env.ORCHESTRATION_CATALOG_PATH;
+  if (!manifestPath) {
+    orchestrationCatalogCache = ORCHESTRATION_CATALOG;
+    return orchestrationCatalogCache;
+  }
+
+  const manifest = await loadJsonManifest<Record<string, OrchestrationDefinition>>(manifestPath);
+  orchestrationCatalogCache = { ...ORCHESTRATION_CATALOG, ...normalizeCatalog(manifest) };
+  return orchestrationCatalogCache;
+}
+
+async function resolveServiceUrl(service: string): Promise<string> {
+  const registry = await loadServiceRegistry();
+  const url = registry[service];
   if (!url) {
     throw new Error(
       `Service "${service}" is not registered. ` +
-      `orchestrationActivity.ts の SERVICE_REGISTRY にエントリを追加してください。`,
+      `Set SERVICE_REGISTRY_PATH or add a service URL entry for this deployment.`,
     );
   }
   return url;
+}
+
+export async function resolveOrchestrationDefinitionActivity(orchestrationId: string): Promise<OrchestrationDefinition> {
+  const catalog = await loadOrchestrationCatalog();
+  const orchestration = catalog[orchestrationId];
+
+  if (!orchestration) {
+    throw new Error(
+      `Orchestration "${orchestrationId}" is not registered. ` +
+      `Set ORCHESTRATION_CATALOG_PATH or keep the definition in the built-in catalog.`,
+    );
+  }
+
+  return orchestration;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -111,7 +191,7 @@ async function runCompensations(
     if (!prevResult) continue;
 
     const ctx      = { ...buildContext(request, stepResults), result: prevResult.body };
-    const baseUrl  = resolveServiceUrl(comp.service);
+    const baseUrl  = await resolveServiceUrl(comp.service);
     const compPath = interpolate(comp.path, ctx);
     const compBody = comp.body    ? interpolateDeep(comp.body,    ctx) : undefined;
     const compHdrs = comp.headers ? interpolateDeep(comp.headers, ctx) as Record<string, string> : {};
@@ -164,7 +244,7 @@ export async function executeOrchestrationActivity(request: PlatformRequest): Pr
   for (let i = 0; i < steps.length; i++) {
     const step = steps[i];
     if (!step) continue;  // noUncheckedIndexedAccess ガード
-    const baseUrl         = resolveServiceUrl(step.service);
+    const baseUrl         = await resolveServiceUrl(step.service);
     const ctx             = buildContext(request, stepResults);
     const resolvedPath    = interpolate(step.path, ctx);
     const resolvedBody    = step.body    ? interpolateDeep(step.body,    ctx) : undefined;
