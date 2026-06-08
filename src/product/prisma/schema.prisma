@@ -1,6 +1,6 @@
 generator client {
   provider = "prisma-client-js"
-  output   = "../../../node_modules/.prisma/product-client"
+  // use default output path so @prisma/client resolves correctly
 }
 
 datasource db {
@@ -22,4 +22,31 @@ model PlatformRequest {
 
   @@map("platform_requests")
   @@index([tenantId, resource])
+}
+
+model OrchestrationDefinition {
+  // orchestrationId (例: "file-upload-and-mail")
+  id          String   @id
+  title       String?
+  description String?
+  // JSON 形式の orchestration 定義
+  definition  Json
+  enabled     Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@map("orchestration_definitions")
+  @@index([enabled])
+}
+
+model OrchestrationVersion {
+  id              String   @id @default(cuid())
+  orchestrationId String
+  version         Int
+  definition      Json
+  createdBy       String?
+  createdAt       DateTime @default(now())
+
+  @@map("orchestration_versions")
+  @@index([orchestrationId])
 }

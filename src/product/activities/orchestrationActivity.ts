@@ -114,20 +114,6 @@ async function resolveServiceUrl(service: string): Promise<string> {
   return url;
 }
 
-export async function resolveOrchestrationDefinitionActivity(orchestrationId: string): Promise<OrchestrationDefinition> {
-  const catalog = await loadOrchestrationCatalog();
-  const orchestration = catalog[orchestrationId];
-
-  if (!orchestration) {
-    throw new Error(
-      `Orchestration "${orchestrationId}" is not registered. ` +
-      `Set ORCHESTRATION_CATALOG_PATH or keep the definition in the built-in catalog.`,
-    );
-  }
-
-  return orchestration;
-}
-
 // ─────────────────────────────────────────────────────────────────────────────
 // テンプレート補間ヘルパー
 // ─────────────────────────────────────────────────────────────────────────────

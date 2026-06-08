@@ -204,6 +204,25 @@ src/product/
     └── loadPolicy.ts           OPA へポリシー+データをロードするスクリプト
 ```
 
+## DB セットアップ
+
+Prisma のマイグレーションと初期シードをまとめて実行するための npm スクリプトを追加しました。ローカル DB に対してマイグレーションとシードを実行するには次を実行してください。
+
+```bash
+npm run db:setup
+```
+
+必要に応じて個別に実行することもできます:
+
+```bash
+npm run prisma:generate
+npm run prisma:migrate
+npm run seed:orchestrations
+```
+
+注意: 本番環境で実行する場合は事前にバックアップを取得し、認証情報や接続先を確認してください。
+
+
 ### 主要な本番品質機能
 
 | 機能 | 実装 |
@@ -253,3 +272,66 @@ NATS へのテストメッセージ送信例:
 新しい連携を追加する場合は、deployment 固有の manifest に定義を追加してください。サービス接続先は `SERVICE_REGISTRY_PATH` で上書きでき、マイクロサービスの追加・変更・削除をコード修正なしで吸収しやすくなります。実行エンジンは `src/product/activities/orchestrationActivity.ts` を共通利用します。
 
 変更を行いました。
+
+DB に orchestration 定義を保持する手順
+
+- Prisma マイグレーションを実行してテーブルを作成します:
+
+```bash
+npm run prisma:migrate
+```
+
+- ビルトインの orchestration 定義を DB に投入します:
+
+```bash
+npm run seed:orchestrations
+```
+
+これにより `orchestration_definitions` テーブルに JSON 形式で定義が登録され、ワークフローは DB から定義を読み出して実行します。
+
+注意点（バリデーション）:
+
+- シードや DB から読み出した定義はランタイムで簡易バリデーションされます。`steps` 配列や各 `service`/`method`/`path` の型が正しくない場合はエラーになり、ワーカーやシード処理が失敗します。
+- 本番運用では Schema バリデーション（JSON Schema/スキーマ管理）を追加して、CI や管理 API 側で投入前チェックすることを推奨します。
+
+DB 専用運用について:
+
+- リポジトリ内の `src/product/orchestrations/*` にあるビルトイン定義はあくまで初期カタログ（シードソース）です。運用で完全に DB のみを使う場合は、これらのファイルを削除してシードを DB に移行することが可能です。
+- ファイルを削除する場合は、必ず既存の DB レコードが正しく存在することを確認してからデプロイしてください。
+
+管理 API と検証スクリプト:
+
+- ローカルで定義を管理する簡易管理 API を用意しています。起動:
+
+```bash
+npm run start:admin
+```
+
+- DB 内の全定義を検証するスクリプト:
+
+```bash
+npm run validate:orchestrations
+```
+
+これらは小さな運用補助ツールです。本番では認証/認可を追加してください。
+
+認証設定 (追加):
+
+- 簡易 JWT 認証を導入しました。環境変数で設定できます（ローカルデフォルトあり）:
+
+   - `ADMIN_API_JWT_SECRET` — JWT 署名シークレット（本番では安全な値を設定してください）
+   - `ADMIN_API_USER` — 管理者ユーザー名（デフォルト: `admin`）
+   - `ADMIN_API_PASSWORD` — 管理者パスワード（デフォルト: `password`）
+
+- トークン取得: `POST /login` に `{ "username": "...", "password": "..." }` を送信すると `{ "token": "..." }` が返ります。
+- 作成/更新/削除ルートは `Authorization: Bearer <token>` を要求します。
+
+バージョン管理:
+
+- オーケストレーションのバージョン管理を追加しました。各保存操作は `orchestration_versions` テーブルにバージョンとして記録されます。
+- 利用可能なエンドポイント:
+   - `GET /orchestrations/:id/versions` — バージョン一覧
+   - `GET /orchestrations/:id/versions/:vid` — バージョン取得
+   - `POST /orchestrations/:id/restore/:vid` — 指定バージョンで復元（新しいバージョンとして保存されます）
+
+フロントエンドの管理 UI はバージョン表示と復元機能を備えています（`History` ボタン）。

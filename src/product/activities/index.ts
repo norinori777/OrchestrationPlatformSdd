@@ -14,9 +14,10 @@ import { createEvaluatePolicyActivity }   from './opaActivity.ts';
 import { createSendNotificationActivity } from './notificationActivity.ts';
 import { createPersistRequestActivity }   from './persistenceActivity.ts';
 import { createCheckQuotaActivity }       from './quotaActivity.ts';
-import { executeOrchestrationActivity, resolveOrchestrationDefinitionActivity }   from './orchestrationActivity.ts';
+import { executeOrchestrationActivity }   from './orchestrationActivity.ts';
 // @ts-ignore — カスタム出力パスから生成された Prisma Client
 import { PrismaClient } from '../../../node_modules/.prisma/product-client/index.js';
+import { validateOrchestrationDefinition } from '../orchestrations/validateOrchestration.ts';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // マイクロサービス接続先 (環境変数で上書き可)
@@ -202,6 +203,31 @@ async function compensateRequestActivity(request: PlatformRequest): Promise<stri
 // ─────────────────────────────────────────────────────────────────────────────
 export function createActivities(config: Config, logger: Logger, redis: Redis, nc: NatsConnection) {
   const prisma = new PrismaClient();
+  
+  // DB-backed orchestration loaders
+  async function resolveOrchestrationDefinitionActivity(orchestrationId: string) : Promise<OrchestrationDefinition> {
+    const row = await prisma.orchestrationDefinition.findUnique({ where: { id: orchestrationId } });
+    if (!row || !row.enabled) {
+      throw new Error(`Orchestration "${orchestrationId}" is not registered or disabled`);
+    }
+    // row.definition is Prisma Json value — validate shape
+    const def = row.definition as unknown;
+    const res = validateOrchestrationDefinition(def);
+    if (!res.valid) {
+      throw new Error(`Orchestration "${orchestrationId}" has invalid definition: ${res.errors.join('; ')}`);
+    }
+    return def as OrchestrationDefinition;
+  }
+
+  async function listOrchestrationCatalogActivity(): Promise<{ id: string; title?: string; description?: string; enabled: boolean }[]> {
+    const rows = await prisma.orchestrationDefinition.findMany({ select: { id: true, title: true, description: true, enabled: true } });
+    return rows.map(r => {
+      const out: { id: string; title?: string; description?: string; enabled: boolean } = { id: r.id, enabled: r.enabled };
+      if (r.title != null) out.title = r.title;
+      if (r.description != null) out.description = r.description;
+      return out;
+    });
+  }
   return {
     evaluatePolicyActivity:      createEvaluatePolicyActivity(config, logger),
     sendNotificationActivity:    createSendNotificationActivity(config, logger, nc),
@@ -211,6 +237,7 @@ export function createActivities(config: Config, logger: Logger, redis: Redis, n
     processRequestActivity,
     executeOrchestrationActivity,
     resolveOrchestrationDefinitionActivity,
+    listOrchestrationCatalogActivity,
   };
 }
 
@@ -220,6 +247,7 @@ export type PlatformActivities = {
   processRequestActivity(request: PlatformRequest): Promise<string>;
   executeOrchestrationActivity(request: PlatformRequest): Promise<string>;
   resolveOrchestrationDefinitionActivity(orchestrationId: string): Promise<OrchestrationDefinition>;
+  listOrchestrationCatalogActivity(): Promise<{ id: string; title?: string; description?: string; enabled: boolean }[]>;
   compensateRequestActivity(request: PlatformRequest): Promise<string>;
   sendNotificationActivity(payload: NotificationPayload): Promise<void>;
   persistRequestActivity(request: PlatformRequest, status: RequestStatus, result?: string): Promise<void>;

@@ -1,0 +1,11 @@
+body { margin: 0; font-family: Inter, 'Segoe UI', Roboto, system-ui, -apple-system, 'Helvetica Neue', Arial; }
+.app { padding: 12px; }
+.catalog { display: flex; gap: 20px; }
+.catalog .sidebar { width: 360px; border-right: 1px solid #eee; padding-right: 12px; }
+.catalog .content { flex: 1; padding-left: 12px; }
+.list-item { display:flex; align-items:center; justify-content:space-between; padding:8px 6px; border-bottom:1px solid #f5f5f5 }
+.btn { padding:6px 10px; border-radius:4px; border:1px solid #ddd; background:white }
+.btn-danger { background:#d9534f; color:white; border:none }
+.modal-backdrop { position:fixed; inset:0; background:rgba(0,0,0,0.35); display:flex; align-items:center; justify-content:center }
+.modal { width:90%; height:80%; background:white; padding:12px; display:flex; gap:12px }
+.json-area { width:100%; height:100%; font-family:monospace }

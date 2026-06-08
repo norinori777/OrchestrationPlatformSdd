@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.com/schemas/orchestration.schema.json",
+  "title": "OrchestrationDefinition",
+  "type": "object",
+  "properties": {
+    "steps": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "properties": {
+          "service": { "type": "string", "minLength": 1 },
+          "method": { "type": "string", "enum": ["GET","POST","PUT","PATCH","DELETE"] },
+          "path": { "type": "string", "minLength": 1 },
+          "headers": { "type": "object", "additionalProperties": { "type": "string" } },
+          "query": { "type": "object", "additionalProperties": { "type": "string" } },
+          "body": { "type": "object" },
+          "compensation": {
+            "type": "object",
+            "properties": {
+              "service": { "type": "string", "minLength": 1 },
+              "method": { "type": "string", "enum": ["GET","POST","PUT","PATCH","DELETE"] },
+              "path": { "type": "string", "minLength": 1 },
+              "headers": { "type": "object", "additionalProperties": { "type": "string" } },
+              "query": { "type": "object", "additionalProperties": { "type": "string" } },
+              "body": { "type": "object" }
+            },
+            "required": ["service","method","path"],
+            "additionalProperties": false
+          }
+        },
+        "required": ["service","method","path"],
+        "additionalProperties": false
+      }
+    }
+  },
+  "required": ["steps"],
+  "additionalProperties": false
+}
