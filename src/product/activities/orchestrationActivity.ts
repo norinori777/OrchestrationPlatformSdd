@@ -28,7 +28,6 @@ import type {
   OrchestrationStep,
   StepResult,
 } from '../types.ts';
-import { ORCHESTRATION_CATALOG } from '../orchestrations/catalog.ts';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // サービスレジストリ — サービス名 → ベース URL
@@ -84,22 +83,6 @@ async function loadServiceRegistry(): Promise<ServiceRegistry> {
   const manifest = await loadJsonManifest<Record<string, string>>(manifestPath);
   serviceRegistryCache = { ...DEFAULT_SERVICE_REGISTRY, ...manifest };
   return serviceRegistryCache;
-}
-
-async function loadOrchestrationCatalog(): Promise<OrchestrationCatalog> {
-  if (orchestrationCatalogCache) {
-    return orchestrationCatalogCache;
-  }
-
-  const manifestPath = process.env.ORCHESTRATION_CATALOG_PATH;
-  if (!manifestPath) {
-    orchestrationCatalogCache = ORCHESTRATION_CATALOG;
-    return orchestrationCatalogCache;
-  }
-
-  const manifest = await loadJsonManifest<Record<string, OrchestrationDefinition>>(manifestPath);
-  orchestrationCatalogCache = { ...ORCHESTRATION_CATALOG, ...normalizeCatalog(manifest) };
-  return orchestrationCatalogCache;
 }
 
 async function resolveServiceUrl(service: string): Promise<string> {
