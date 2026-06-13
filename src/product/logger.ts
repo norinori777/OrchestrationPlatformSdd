@@ -22,6 +22,22 @@ export interface Logger {
   child(bindings: Record<string, unknown>): Logger;
 }
 
+const VECTOR_LOG_URL = process.env.VECTOR_LOG_URL ?? 'http://localhost:9001';
+
+async function sendToVector(payload: Record<string, unknown>): Promise<void> {
+  try {
+    await fetch(VECTOR_LOG_URL, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify(payload),
+    });
+  } catch {
+    // Vector が一時的に利用できない場合でも、アプリ本体の処理を止めない。
+  }
+}
+
 function makeLogger(
   minLevel: LogLevel,
   service: string,
@@ -31,7 +47,7 @@ function makeLogger(
 
   function write(level: LogLevel, msg: string, data: Record<string, unknown>): void {
     if (LEVEL_RANK[level] < minRank) return;
-    const entry = JSON.stringify({
+    void sendToVector({
       ts:      new Date().toISOString(),
       level,
       service,
@@ -39,7 +55,6 @@ function makeLogger(
       msg,
       ...data,
     });
-    (level === 'error' ? process.stderr : process.stdout).write(entry + '\n');
   }
 
   return {
