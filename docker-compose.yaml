@@ -37,8 +37,18 @@ services:
     container_name: temporal-ui
     environment:
       - TEMPORAL_ADDRESS=temporal:7233
+      - TEMPORAL_AUTH_ENABLED=true
+      - TEMPORAL_AUTH_LABEL=Keycloak
+      - TEMPORAL_AUTH_TYPE=oidc
+      - TEMPORAL_AUTH_PROVIDER_URL=http://keycloak:8080/realms/orchestration
+      - TEMPORAL_AUTH_ISSUER_URL=http://keycloak:8080/realms/orchestration
+      - TEMPORAL_AUTH_CLIENT_ID=temporal-ui
+      - TEMPORAL_AUTH_CLIENT_SECRET=temporal-secret
+      - TEMPORAL_AUTH_CALLBACK_URL=http://localhost:8080/auth/sso/callback
+      - TEMPORAL_AUTH_SCOPES=openid,profile,email,offline_access
     depends_on:
       - temporal
+      - keycloak
     networks:
       - saas-platform
     ports:
@@ -129,6 +139,56 @@ services:
       - "4317:4317"   # OTLP gRPC
       - "4318:4318"   # OTLP HTTP (platform の OTEL_EXPORTER_OTLP_ENDPOINT に合わせる)
 
+  # 10. Keycloak (OIDC / OAuth2 認証基盤)
+  keycloak-db:
+    image: postgres:15-alpine
+    container_name: keycloak-db
+    environment:
+      - POSTGRES_USER=keycloak
+      - POSTGRES_PASSWORD=keycloak
+      - POSTGRES_DB=keycloak
+    volumes:
+      - keycloak-db-data:/var/lib/postgresql/data
+    networks:
+      - saas-platform
+    ports:
+      - "5433:5432" # Keycloak 用 PostgreSQL (既存 postgres と分離)
+
+  keycloak:
+    image: quay.io/keycloak/keycloak:25.0.6
+    container_name: keycloak
+    command: ["start-dev"]
+    environment:
+      - KEYCLOAK_ADMIN=admin
+      - KEYCLOAK_ADMIN_PASSWORD=admin
+      - KC_DB=postgres
+      - KC_DB_URL=jdbc:postgresql://keycloak-db:5432/keycloak
+      - KC_DB_USERNAME=keycloak
+      - KC_DB_PASSWORD=keycloak
+      - KC_HTTP_ENABLED=true
+      - KC_PROXY=edge
+      - KC_HOSTNAME_STRICT=false
+      - KC_HEALTH_ENABLED=true
+      - KC_METRICS_ENABLED=true
+    depends_on:
+      - keycloak-db
+    networks:
+      - saas-platform
+    ports:
+      - "8081:8080" # Keycloak 管理画面 / OIDC エンドポイント
+
+  keycloak-init:
+    image: quay.io/keycloak/keycloak:25.0.6
+    container_name: keycloak-init
+    depends_on:
+      - keycloak
+    command: ["/bin/bash", "/opt/keycloak/data/import/setup-realm.sh"]
+    volumes:
+      - ./config/keycloak:/opt/keycloak/data/import:ro
+    networks:
+      - saas-platform
+    restart: "no"
+
 networks:
   saas-platform:
     driver: bridge
@@ -137,4 +197,6 @@ volumes:
   redis-data:
     driver: local
   prometheus-data:
+    driver: local
+  keycloak-db-data:
     driver: local

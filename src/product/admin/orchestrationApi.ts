@@ -4,22 +4,103 @@ import cors from 'cors';
 import { PrismaClient } from '../../../node_modules/.prisma/product-client/index.js';
 import { validateOrchestrationDefinition } from '../orchestrations/validateOrchestration.ts';
 import jwt from 'jsonwebtoken';
+import { createPublicKey, type KeyObject } from 'node:crypto';
 
 const JWT_SECRET = process.env.ADMIN_API_JWT_SECRET ?? 'dev-secret';
 const ADMIN_USER = process.env.ADMIN_API_USER ?? 'admin';
 const ADMIN_PASS = process.env.ADMIN_API_PASSWORD ?? 'password';
+const KEYCLOAK_ISSUER_URL = process.env.ADMIN_API_KEYCLOAK_ISSUER_URL ?? '';
+const KEYCLOAK_AUDIENCE = process.env.ADMIN_API_KEYCLOAK_AUDIENCE ?? '';
+
+type KeycloakJwks = { keys: JsonWebKey[] };
+
+let jwksUriCache: string | undefined;
+let jwksCache: KeycloakJwks | undefined;
+const keyCache = new Map<string, KeyObject>();
+
+async function loadJwksUri(): Promise<string> {
+  if (!KEYCLOAK_ISSUER_URL) {
+    throw new Error('Keycloak issuer URL is not configured');
+  }
+  if (jwksUriCache) {
+    return jwksUriCache;
+  }
+
+  const wellKnownUrl = new URL('.well-known/openid-configuration', `${KEYCLOAK_ISSUER_URL.replace(/\/$/, '')}/`);
+  const res = await fetch(wellKnownUrl);
+  if (!res.ok) {
+    throw new Error(`Unable to load Keycloak OIDC configuration: ${res.status}`);
+  }
+  const body = await res.json() as { jwks_uri?: string };
+  if (!body.jwks_uri) {
+    throw new Error('Keycloak OIDC configuration did not include jwks_uri');
+  }
+
+  jwksUriCache = body.jwks_uri;
+  return jwksUriCache;
+}
+
+async function loadJwks(): Promise<KeycloakJwks> {
+  if (jwksCache) {
+    return jwksCache;
+  }
+
+  const jwksUri = await loadJwksUri();
+  const res = await fetch(jwksUri);
+  if (!res.ok) {
+    throw new Error(`Unable to load Keycloak JWKS: ${res.status}`);
+  }
+  jwksCache = await res.json() as KeycloakJwks;
+  return jwksCache;
+}
+
+async function verifyKeycloakToken(token: string): Promise<jwt.JwtPayload> {
+  const decoded = jwt.decode(token, { complete: true }) as { header?: { kid?: string } } | null;
+  const kid = decoded?.header?.kid;
+  if (!kid) {
+    throw new Error('Missing JWT kid header');
+  }
+
+  const cachedKey = keyCache.get(kid);
+  const key = cachedKey ?? await (async () => {
+    const jwks = await loadJwks();
+    const jwk = jwks.keys.find((entry) => entry.kid === kid);
+    if (!jwk) {
+      throw new Error(`Keycloak JWKS does not contain kid ${kid}`);
+    }
+    const imported = createPublicKey({ key: jwk, format: 'jwk' });
+    keyCache.set(kid, imported);
+    return imported;
+  })();
+
+  return jwt.verify(token, key, {
+    algorithms: ['RS256'],
+    issuer: KEYCLOAK_ISSUER_URL || undefined,
+    audience: KEYCLOAK_AUDIENCE || undefined,
+  }) as jwt.JwtPayload;
+}
+
+async function authenticateToken(token: string): Promise<jwt.JwtPayload> {
+  if (KEYCLOAK_ISSUER_URL) {
+    return verifyKeycloakToken(token);
+  }
+
+  return jwt.verify(token, JWT_SECRET) as jwt.JwtPayload;
+}
 
 function requireAuth(req: any, res: any, next: any) {
   const auth = req.headers['authorization'] as string | undefined;
   if (!auth || !auth.startsWith('Bearer ')) return res.status(401).json({ error: 'Unauthorized' });
   const token = auth.slice(7);
-  try {
-    const payload = jwt.verify(token, JWT_SECRET);
-    req.user = payload;
-    return next();
-  } catch (err) {
-    return res.status(401).json({ error: 'Unauthorized' });
-  }
+
+  void authenticateToken(token)
+    .then((payload) => {
+      req.user = payload;
+      next();
+    })
+    .catch(() => {
+      res.status(401).json({ error: 'Unauthorized' });
+    });
 }
 
 const app = express();

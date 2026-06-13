@@ -1,0 +1,20 @@
+{
+  "clientId": "temporal-ui",
+  "enabled": true,
+  "protocol": "openid-connect",
+  "publicClient": false,
+  "secret": "temporal-secret",
+  "standardFlowEnabled": true,
+  "directAccessGrantsEnabled": true,
+  "redirectUris": [
+    "http://localhost:8080/auth/sso/callback",
+    "http://localhost:8080/auth/sso_callback"
+  ],
+  "webOrigins": [
+    "http://localhost:8080"
+  ],
+  "attributes": {
+    "post.logout.redirect.uris": "http://localhost:8080/*"
+  },
+  "protocolMappers": []
+}
