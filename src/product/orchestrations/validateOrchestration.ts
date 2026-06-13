@@ -4,7 +4,7 @@ import path from 'node:path';
 import Ajv2020 from 'ajv/dist/2020.js';
 import addFormats from 'ajv-formats';
 
-const schemaPath = path.resolve(process.cwd(), 'src', 'product', 'orchestrations', 'orchestration.schema.json');
+const schemaPath = path.resolve(process.cwd(), 'orchestrations', 'orchestration.schema.json');
 let compiled: any = null;
 
 function loadCompiler() {

@@ -18,22 +18,25 @@ if errorlevel 1 goto :error
 call :wait_for_opa || goto :error
 
 echo Starting orchestration platform...
-start "Orchestration Platform" cmd /k "cd /d ""%ROOT%"" && npx ts-node src/product/index.ts"
+start "Orchestration Platform" cmd /k "cd /d ""%ROOT%\src\product"" && npx prisma migrate deploy && npx ts-node index.ts"
 
 echo Starting SaaS backend...
-start "SaaS Backend" cmd /k "cd /d ""%ROOT%\src\Saas\backend"" && npm run dev"
+start "SaaS Backend" cmd /k "cd /d ""%ROOT%\src\Saas\backend"" && npx prisma migrate deploy && npm run dev"
 
 echo Starting SaaS frontend...
 start "SaaS Frontend" cmd /k "cd /d ""%ROOT%\src\Saas\frontend"" && npm run dev"
 
 echo Starting user microservice...
-start "User Service" cmd /k "cd /d ""%ROOT%\src\MicroService\UserService"" && npm run dev"
+start "User Service" cmd /k "cd /d ""%ROOT%\src\MicroService\UserService"" && npx prisma migrate deploy&& npm run dev"
 
 echo Starting file storage microservice...
-start "File Storage Service" cmd /k "cd /d ""%ROOT%\src\MicroService\FileStorageService"" && npm run dev"
+start "File Storage Service" cmd /k "cd /d ""%ROOT%\src\MicroService\FileStorageService"" && npx prisma migrate deploy && npm run dev"
 
 echo Starting routing file microservice...
-start "Routing File Service" cmd /k "cd /d ""%ROOT%\src\MicroService\RoutingFile"" && npm run dev"
+start "Routing File Service" cmd /k "cd /d ""%ROOT%\src\MicroService\RoutingFile"" && npx prisma migrate deploy && npm run dev"
+
+echo Loading platform policy into OPA...
+npx ts-node src/product/policies/loadPolicy.ts
 
 echo.
 echo All components were launched in separate windows.
